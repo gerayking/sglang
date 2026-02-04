@@ -76,7 +76,8 @@ class BaseFormatDetector(ABC):
         results = []
         for act in action:
             name = act.get("name")
-            if not (name and name in tool_indices):
+            # When tools list is empty, skip validation and allow all tool calls
+            if tools and not (name and name in tool_indices):
                 logger.warning(f"Model attempted to call undefined function: {name}")
                 if not envs.SGLANG_FORWARD_UNKNOWN_TOOLS.get():
                     continue  # Skip unknown tools (default legacy behavior)
@@ -185,8 +186,8 @@ class BaseFormatDetector(ABC):
                     current_text[start_idx : start_idx + end_idx]
                 )
 
-                # Validate tool name if present
-                if "name" in obj and obj["name"] not in self._tool_indices:
+                # Validate tool name if present (skip validation when tools list is empty)
+                if self._tool_indices and "name" in obj and obj["name"] not in self._tool_indices:
                     # Invalid tool name - reset state
                     self._buffer = ""
                     self.current_tool_id = -1
@@ -216,7 +217,8 @@ class BaseFormatDetector(ABC):
             if not self.current_tool_name_sent:
                 function_name = current_tool_call.get("name")
 
-                if function_name and function_name in self._tool_indices:
+                # When tools list is empty (_tool_indices is empty), allow all function names
+                if function_name and (not self._tool_indices or function_name in self._tool_indices):
                     # If this is a new tool (current_tool_id was -1), initialize it
                     if self.current_tool_id == -1:
                         self.current_tool_id = 0

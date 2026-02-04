@@ -62,6 +62,17 @@ class NGRAMWorker:
     def clear_cache_pool(self):
         self.ngram_cache.reset()
 
+    def insert_external_content(self, token_ids_list: List[List[int]]):
+        """Insert external content into the ngram cache.
+
+        Args:
+            token_ids_list: A list of token id sequences to be inserted into the ngram cache.
+                           Each sequence will be added to the Trie tree for future n-gram matching.
+        """
+        if not token_ids_list:
+            return
+        self.ngram_cache.batch_put(token_ids_list)
+
     def _efficient_concat_last_n(self, seq1: List[int], seq2: List[int], n: int):
         seq2_len = len(seq2)
         if seq2_len >= n:

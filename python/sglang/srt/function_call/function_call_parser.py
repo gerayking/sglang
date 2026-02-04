@@ -78,8 +78,7 @@ class FunctionCallParser:
         Returns:
             True if the text contains a tool call, False otherwise
         """
-        if not self.tools:
-            return False
+        # Allow detection even without tools defined
         return self.detector.has_tool_call(text)
 
     def parse_non_stream(self, full_text: str) -> Tuple[str, list[ToolCallItem]]:
@@ -94,9 +93,8 @@ class FunctionCallParser:
             - The remaining text after parsing that was not consumed by the detector (can be treated as normal text)
             - A list of tool calls parsed from the text
         """
-        if not self.tools:
-            return full_text, []
-        parsed_result = self.detector.detect_and_parse(full_text, self.tools)
+        # Allow parsing even without tools defined
+        parsed_result = self.detector.detect_and_parse(full_text, self.tools or [])
         tool_call_list = parsed_result.calls
         if tool_call_list:
             return parsed_result.normal_text, tool_call_list
@@ -115,12 +113,11 @@ class FunctionCallParser:
             - The normal text that should be displayed to the user
             - A list of tool calls parsed from the chunk
         """
-        if not self.tools:
-            return chunk_text, []
+        # Allow parsing even without tools defined
         final_normal_text = ""
         final_calls = []
 
-        sp_result = self.detector.parse_streaming_increment(chunk_text, self.tools)
+        sp_result = self.detector.parse_streaming_increment(chunk_text, self.tools or [])
         if sp_result.normal_text:
             final_normal_text = sp_result.normal_text
         if sp_result.calls:

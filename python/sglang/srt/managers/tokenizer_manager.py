@@ -868,6 +868,16 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 SessionParams(**obj.session_params) if obj.session_params else None
             )
 
+            # Tokenize extra_ngram_content if provided
+            extra_ngram_token_ids = None
+            if hasattr(obj, "extra_ngram_content") and obj.extra_ngram_content:
+                extra_ngram_content = obj.extra_ngram_content
+                if isinstance(extra_ngram_content, str):
+                    extra_ngram_content = [extra_ngram_content]
+                extra_ngram_token_ids = [
+                    self.tokenizer.encode(content) for content in extra_ngram_content
+                ]
+
             tokenized_obj = TokenizedGenerateReqInput(
                 input_text,
                 input_ids,
@@ -891,6 +901,7 @@ class TokenizerManager(TokenizerCommunicatorMixin):
                 data_parallel_rank=obj.data_parallel_rank,
                 priority=obj.priority,
                 extra_key=obj.extra_key,
+                extra_ngram_token_ids=extra_ngram_token_ids,
             )
         elif isinstance(obj, EmbeddingReqInput):
             tokenized_obj = TokenizedEmbeddingReqInput(

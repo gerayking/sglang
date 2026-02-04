@@ -227,6 +227,10 @@ class GenerateReqInput(BaseReq):
     # Whether to return entropy
     return_entropy: bool = False
 
+    # Extra content to be inserted into ngram cache for speculative decoding
+    # Can be a single string or a list of strings
+    extra_ngram_content: Optional[Union[List[str], str]] = None
+
     def contains_mm_input(self) -> bool:
         return (
             has_valid_data(self.image_data)
@@ -695,6 +699,10 @@ class TokenizedGenerateReqInput(BaseReq):
 
     # Whether to return entropy
     return_entropy: bool = False
+
+    # Extra ngram content token ids for speculative decoding
+    # List of token id sequences to be inserted into ngram cache
+    extra_ngram_token_ids: Optional[List[List[int]]] = None
 
 
 @dataclass

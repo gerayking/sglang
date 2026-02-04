@@ -591,9 +591,9 @@ class OpenAIServingChat(OpenAIServingBase):
                 # Handle tool calls
                 if (
                     request.tool_choice != "none"
-                    and request.tools
                     and self.tool_call_parser
                 ):
+                    # Allow parsing even without tools defined in request
                     async for chunk in self._process_tool_call_stream(
                         index,
                         delta,
@@ -796,13 +796,13 @@ class OpenAIServingChat(OpenAIServingBase):
             tool_calls = None
             if (
                 request.tool_choice != "none"
-                and request.tools
                 and self.tool_call_parser
             ):
+                # Allow parsing even without tools defined in request
                 history_tool_calls_cnt = self._get_history_tool_calls_cnt(request)
                 tool_calls, text, finish_reason = self._process_tool_calls(
                     text,
-                    request.tools,
+                    request.tools or [],
                     finish_reason,
                     request.tool_choice,
                     history_tool_calls_cnt,
@@ -1092,7 +1092,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 parser_dict[index] = JsonArrayParser()
             else:
                 parser_dict[index] = FunctionCallParser(
-                    tools=request.tools,
+                    tools=request.tools or [],  # Allow empty tools
                     tool_call_parser=self.tool_call_parser,
                 )
 
@@ -1100,7 +1100,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         # Handle both FunctionCallParser and JsonArrayParser
         if isinstance(parser, JsonArrayParser):
-            result = parser.parse_streaming_increment(delta, request.tools)
+            result = parser.parse_streaming_increment(delta, request.tools or [])
             normal_text, calls = result.normal_text, result.calls
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)

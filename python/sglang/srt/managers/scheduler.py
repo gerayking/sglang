@@ -1439,6 +1439,14 @@ class Scheduler(
                         error_msg = f"Invalid grammar request with cache hit: {key=}"
                         req.set_finish_with_abort(error_msg)
 
+        # Handle extra ngram content for speculative decoding
+        if (
+            self.spec_algorithm.is_ngram()
+            and hasattr(recv_req, "extra_ngram_token_ids")
+            and recv_req.extra_ngram_token_ids
+        ):
+            self.draft_worker.insert_external_content(recv_req.extra_ngram_token_ids)
+
         if add_to_grammar_queue:
             self.grammar_queue.append(req)
         else:
