@@ -35,6 +35,7 @@ class PrefillCaptureCoordinator:
 
     def __init__(self, *, config, teacher, kv):
         self.config, self.teacher, self.kv = config, teacher, kv
+        self.config_sha256 = config.fingerprint
         self.contract_sha256 = contract_digest(teacher, kv)
         self.capture_mode = "pd_autoregressive"
         self.disabled_reason = None
@@ -277,8 +278,13 @@ class DecodeCaptureMixin:
             slots = self.req_to_token.req_to_token[
                 req.req_pool_idx, : context.prompt_length
             ].clone()
-            if context.owns_kv:
+            kv_source = getattr(getattr(self, "config", None), "kv_source", "device")
+            if context.owns_kv and kv_source == "device":
                 context.export_kv(self.exporter, slots, end=context.prompt_length)
+            elif context.owns_kv:
+                context.defer_kv_progress(
+                    end=context.prompt_length, device=self.resources.device
+                )
             else:
                 context.record_kv_progress(end=context.prompt_length)
             if context.owns_aux:

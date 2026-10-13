@@ -148,11 +148,17 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, is_insert: bool = Tr
         return
 
     effective_kv_committed_len = req.effective_kv_committed_len()
+    prepare_l2 = getattr(req, "training_capture_prepare_l2", None)
+    if prepare_l2 is not None:
+        prepare_l2(req, effective_kv_committed_len)
     tree_cache.cache_finished_req(
         req,
         is_insert=is_insert and not getattr(req, "skip_radix_cache_insert", False),
         kv_len_to_handle=effective_kv_committed_len,
     )
+    finalize_after_cache = getattr(req, "training_capture_finalize_after_cache", None)
+    if finalize_after_cache is not None:
+        finalize_after_cache(req)
 
     # StreamingSession.cache_finished_req handles speculative tail trim
     # internally, then sets req_pool_idx = None.

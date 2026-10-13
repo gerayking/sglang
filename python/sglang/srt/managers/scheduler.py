@@ -553,6 +553,14 @@ class Scheduler(
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
         self.disable_radix_cache = result.disable_radix_cache
         self.tree_cache = result.tree_cache
+        self.tp_worker.init_training_capture(
+            tree_cache=self.tree_cache,
+            metrics_labels=(
+                self.metrics_collector.labels
+                if self.metrics_collector is not None
+                else None
+            ),
+        )
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -1009,14 +1017,6 @@ class Scheduler(
             and get_exec().moe.ep_join_mode == "recover"
         ):
             model_runner.post_capture_elastic_ep_recover()
-
-        self.tp_worker.init_training_capture(
-            metrics_labels=(
-                self.metrics_collector.labels
-                if self.metrics_collector is not None
-                else None
-            )
-        )
 
         # Dispatch the model worker
         if self.spec_algorithm.is_none():

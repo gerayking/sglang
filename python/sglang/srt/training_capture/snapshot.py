@@ -10,9 +10,11 @@ import msgspec
 import torch
 from sglang.srt.training_capture.catalog import (
     MAX_CATALOG_REQUEST_BYTES,
+    CaptureLease,
     manifest_descriptor,
     seal_request_nbytes,
 )
+from sglang.srt.training_capture.codec import get_codec
 from sglang.srt.training_capture.protocol import (
     ELEMENT_BYTES,
     OWNER,
@@ -26,12 +28,10 @@ from sglang.srt.training_capture.protocol import (
     TeacherIdentity,
     TensorDescriptor,
     Topology,
-    aux_specs,
     canonical_bytes,
     digest_bytes,
     tensor_bytes,
     validate_kv_spec,
-    validate_manifest,
     validate_tensors,
 )
 from sglang.srt.training_capture.topology import (
@@ -51,6 +51,25 @@ class SnapshotMetadata(msgspec.Struct, frozen=True, kw_only=True):
     provenance: Provenance
     contract_id: str = "maas-target-kv-top128-v1"
     topology: Topology = msgspec.field(default_factory=Topology)
+
+
+class SealedCapture(msgspec.Struct, frozen=True, kw_only=True):
+    """Accepted sequence frozen by serving, before Host materialization completes."""
+
+    sequence: SequenceInfo
+    token_ids: tuple[int, ...]
+    valid_kv_tokens: int
+    teacher_rows: int
+
+
+class HostReadyCapture(msgspec.Struct, frozen=True, kw_only=True):
+    """IPC descriptor for immutable bytes in an already completed shared Host slot."""
+
+    slot_id: int
+    slot_epoch: int
+    metadata: SnapshotMetadata
+    valid_kv_tokens: int
+    lease: CaptureLease
 
 
 class PreparedSnapshotPartition(msgspec.Struct, frozen=True, kw_only=True):
@@ -80,6 +99,7 @@ def manifest_fits_budget(metadata, *, layout, lease, manifest_buffer_bytes):
 
 
 def _manifest_size_bound(metadata, *, layout):
+    codec = get_codec(metadata.contract_id)
     n, r = metadata.sequence.total_length, metadata.sequence.response_length
     kv = metadata.kv
     prefix = f"draft-data/{metadata.dataset_id}/{metadata.sample_id}/{metadata.generation_id}/"
@@ -105,7 +125,7 @@ def _manifest_size_bound(metadata, *, layout):
         object_count += copies
         return descriptor.nbytes
 
-    for name, (dtype, shape) in aux_specs(n, r).items():
+    for name, (dtype, shape) in codec.aux_specs(n, r).items():
         total_tensor_bytes += count(
             name, dtype, shape, "aux/" + name, "aux", layout.topology.aux_owner
         )
@@ -136,7 +156,7 @@ def _manifest_size_bound(metadata, *, layout):
                     head_range=(heads.start, heads.end),
                 )
                 total_tensor_bytes += n * width * dim * ELEMENT_BYTES[kv.dtype]
-    envelope = Manifest(
+    envelope = codec.manifest_type(
         **{
             name: getattr(metadata, name)
             for name in metadata.__struct_fields__
@@ -162,7 +182,7 @@ def build_snapshot(
     manifest, tensors = prepare_snapshot(
         metadata, buffers, valid_kv_tokens=valid_kv_tokens
     )
-    validate_tensors(manifest, tensors)
+    validate_tensors(manifest, tensors, _codec=get_codec(metadata.contract_id))
     return manifest, tensors
 
 
@@ -272,7 +292,7 @@ def prepare_snapshot_partition(
         tensors[key] = tensor
 
     if partition.include_aux:
-        for name, (_, shape) in aux_specs(n, r).items():
+        for name, (_, shape) in get_codec(metadata.contract_id).aux_specs(n, r).items():
             describe(name, buffers[name][: shape[0]], "aux/" + name, "aux")
     heads = {part.layer_id: (part.start, part.end) for part in partition.heads}
     for layer in layers:
@@ -357,7 +377,8 @@ def assemble_snapshot(
     }
     if len(token_digests) != 1 or token_digests != aux_token_digests:
         raise ContractError("owners disagree on the committed token sequence")
-    manifest = Manifest(
+    codec = get_codec(metadata.contract_id)
+    manifest = codec.manifest_type(
         dataset_id=metadata.dataset_id,
         sample_id=metadata.sample_id,
         generation_id=metadata.generation_id,
@@ -371,6 +392,6 @@ def assemble_snapshot(
         total_tensor_bytes=sum(obj.nbytes for obj in objects),
         topology=topology,
     )
-    if validate_manifest(manifest) != validity.pop():
+    if codec.validate_manifest(manifest) != validity.pop():
         raise ContractError("partition KV validity differs from object coverage")
     return manifest

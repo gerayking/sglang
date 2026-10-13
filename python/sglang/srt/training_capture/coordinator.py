@@ -18,6 +18,7 @@ import torch
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.training_capture.admission import CaptureAdmission
 from sglang.srt.training_capture.catalog import CaptureLease, CatalogConflict
+from sglang.srt.training_capture.codec import get_codec
 from sglang.srt.training_capture.cohort_service import CaptureHandle
 from sglang.srt.training_capture.config import CaptureConfig
 from sglang.srt.training_capture.context import RequestCaptureContext
@@ -34,7 +35,11 @@ from sglang.srt.training_capture.protocol import (
     SequenceInfo,
 )
 from sglang.srt.training_capture.resources import CaptureResources
-from sglang.srt.training_capture.snapshot import SnapshotMetadata, manifest_fits_budget
+from sglang.srt.training_capture.snapshot import (
+    HostReadyCapture,
+    SnapshotMetadata,
+    manifest_fits_budget,
+)
 from sglang.srt.training_capture.snapshot_writer import SnapshotWriter
 from sglang.srt.training_capture.startup import (
     coordinate_capture_activation,
@@ -46,6 +51,7 @@ from sglang.srt.training_capture.teacher import (
     capture_teacher,
     warmup_teacher_capture,
 )
+from sglang.srt.training_capture.teacher_batcher import TeacherRingFull
 from sglang.srt.training_capture.topology import plan_capture_layout
 
 logger = logging.getLogger(__name__)
@@ -109,6 +115,7 @@ class CaptureCoordinator:
         tokenizer_path,
         pool,
         req_to_token,
+        tree_cache=None,
         enable_overlap=False,
         metrics_labels=None,
         startup_group=None,
@@ -133,6 +140,12 @@ class CaptureCoordinator:
         def build_local():
             nonlocal config
             config = CaptureConfig.load(config_path)
+            codec = get_codec(config.contract_id)
+            if (
+                codec.teacher.kind == "final_hidden"
+                and model_config.dtype != torch.bfloat16
+            ):
+                raise ContractError("experimental final-hidden capture requires BF16")
             contract = bind_rank_target_contract(
                 model_id=config.model_id,
                 selected_layer_ids=config.selected_layer_ids,
@@ -149,11 +162,12 @@ class CaptureCoordinator:
                 pp_size=pp_size,
                 dp_rank=dp_rank,
             )
-            warmup_teacher_capture(
-                contract.teacher.vocab_size,
-                getattr(pool, "device", "cpu"),
-                topk_backend=config.teacher_topk_backend,
-            )
+            if codec.teacher.kind == "top128":
+                warmup_teacher_capture(
+                    contract.teacher.vocab_size,
+                    getattr(pool, "device", "cpu"),
+                    topk_backend=config.teacher_topk_backend,
+                )
             return contract
 
         topology = {"tp_size": tp_size, "pp_size": pp_size, "dp_rank": dp_rank}
@@ -201,18 +215,27 @@ class CaptureCoordinator:
                     layout=layout,
                     pool=pool,
                     req_to_token=req_to_token,
+                    tree_cache=tree_cache,
                     enable_overlap=enable_overlap,
                     capture_mode=capture_mode,
                     metrics_labels=metrics_labels,
                 )
-            resources = CaptureResources.prepare(
-                config=config,
-                kv=kv,
-                partition=layout.partition(OWNER),
-                source_pool=pool,
-            )
+            resource_args = {
+                "config": config,
+                "kv": kv,
+                "partition": layout.partition(OWNER),
+                "source_pool": pool,
+            }
+            if config.teacher_capture_backend in ("async_ring", "final_hidden"):
+                resource_args["teacher"] = teacher
+            if tree_cache is not None:
+                resource_args["tree_cache"] = tree_cache
+            resources = CaptureResources.prepare(**resource_args)
             try:
-                if resources.exporter.device.type != "cuda":
+                if (
+                    config.kv_source == "device"
+                    and resources.exporter.device.type != "cuda"
+                ):
                     raise ContractError("serving capture currently requires CUDA")
                 metrics = (
                     CaptureMetrics(metrics_labels)
@@ -271,9 +294,12 @@ class CaptureCoordinator:
         enable_overlap=False,
         metrics=None,
         resources=None,
+        l2_exporter=None,
         autostart=True,
     ):
         self.config, self.teacher, self.kv = config, teacher, kv
+        self.codec = get_codec(config.contract_id)
+        self.config_sha256 = config.fingerprint
         self.layout = plan_capture_layout(
             kv, tp_size=1, pp_layer_ranges=[(0, max(kv.selected_layer_ids) + 1)]
         )
@@ -286,11 +312,25 @@ class CaptureCoordinator:
             store=store,
             catalog=catalog,
             pin_memory=pin_memory,
+            l2_exporter=l2_exporter,
+            teacher=teacher,
         )
-        self.exporter, self.req_to_token = self.resources.exporter, req_to_token
+        self.exporter = self.resources.exporter
+        self.l2_exporter = self.resources.l2_exporter
+        self.req_to_token = req_to_token
         self.store, self.catalog = self.resources.store, self.resources.catalog
         self.pool, self.journal = self.resources.pool, self.resources.journal
-        self.writer = SnapshotWriter(self.store, self.catalog, self.journal)
+        self.teacher_batcher = self.resources.teacher_batcher
+        if self.teacher_batcher is not None and capture_mode != "autoregressive":
+            raise ContractError(
+                "async teacher capture currently supports autoregressive serving"
+            )
+        self.writer_process = self.resources.writer_process
+        if self.writer_process is not None and capture_mode != "autoregressive":
+            raise ContractError("process writer requires autoregressive serving")
+        self.writer = self.writer_process or SnapshotWriter(
+            self.store, self.catalog, self.journal, codec=self.codec
+        )
         self.lock = threading.RLock()
         self.stop = threading.Event()
         self.lease_wake = threading.Event()
@@ -371,7 +411,16 @@ class CaptureCoordinator:
                 "occupied_fraction": occupancy,
                 "writer_age_seconds": writer_age,
                 "stage_timings": self.writer.timings.stats(),
+                "snapshot_writer_backend": self.config.snapshot_writer_backend,
+                "snapshot_writer_pid": (
+                    self.writer_process.process.pid if self.writer_process else None
+                ),
                 "host_pool": self.pool.stats(),
+                "teacher_batcher": (
+                    self.teacher_batcher.stats()
+                    if self.teacher_batcher is not None
+                    else None
+                ),
                 "admission": self.admission.stats(
                     time.monotonic(),
                     disabled=self.disabled_reason is not None or self.admission_paused,
@@ -427,7 +476,7 @@ class CaptureCoordinator:
         sample_id, generation_id = uuid.uuid4().hex, uuid.uuid4().hex
         started = time.monotonic()
         try:
-            lease = self.catalog.begin(
+            lease = (self.writer_process or self.catalog).begin(
                 {
                     "dataset_id": self.config.dataset_id,
                     "sample_id": sample_id,
@@ -531,6 +580,8 @@ class CaptureCoordinator:
         self.requests.pop(record.lease.capture_id, None)
         req.training_capture_context = None
         req.training_capture_finalize = None
+        req.training_capture_prepare_l2 = None
+        req.training_capture_finalize_after_cache = None
         self._queue_record(record)
 
     def _fail_request(self, req, record, reason):
@@ -608,9 +659,18 @@ class CaptureCoordinator:
                 prompt_ids=tuple(req.origin_input_ids),
                 max_tokens=len(req.origin_input_ids) + requested,
                 vocab_size=self.teacher.vocab_size,
+                teacher_batcher=self.teacher_batcher,
+                codec=self.codec,
             )
             req.training_capture_context = record
-            req.training_capture_finalize = self.on_release
+            if self.config.kv_source == "hicache_l2":
+                if getattr(self.l2_exporter, "requires_transient", False):
+                    req.training_capture_prepare_l2 = self.prepare_l2
+                req.training_capture_finalize_after_cache = lambda request: (
+                    self.on_release(request, after_cache=True)
+                )
+            else:
+                req.training_capture_finalize = self.on_release
             self.requests[record.lease.capture_id] = req
             self._count("admitted")
         except Exception:
@@ -671,12 +731,13 @@ class CaptureCoordinator:
         return Provenance(
             capture_mode=self.capture_mode,
             producer_revision=self.config.producer_revision,
-            capture_config_sha256=config_sha256 or self.config.fingerprint,
+            capture_config_sha256=config_sha256 or self.config_sha256,
             sampling_config=sampling,
             trace_id=hashlib.sha256(req.rid.encode()).hexdigest(),
         )
 
     def before_forward(self, reqs):
+        self._drain_l2_releases()
         for req in list(self.requests.values()):
             record = req.training_capture_context
             if record.invalid_reason or req.is_retracted:
@@ -696,6 +757,9 @@ class CaptureCoordinator:
         teacher_indices = []
         teacher_records = []
         offset = 0
+        canonical_positions = self.capture_mode == "autoregressive" and getattr(
+            forward_batch, "positions_are_canonical", False
+        )
         for row, req in enumerate(batch.reqs):
             extend_len = (
                 forward_batch.extend_seq_lens_cpu[row]
@@ -709,16 +773,18 @@ class CaptureCoordinator:
                     if record.invalid_reason:
                         raise ContractError(record.invalid_reason)
                     end = int(batch.seq_lens_cpu[row])
-                    if context.owns_kv:
+                    if context.owns_kv and self.config.kv_source == "device":
                         slots = self.req_to_token.req_to_token[
                             req.req_pool_idx, context.kv_end : end
                         ].clone()
                         context.export_kv(self.exporter, slots, end=end)
+                    elif context.owns_kv:
+                        context.defer_kv_progress(end=end, device=self.resources.device)
                     else:
                         context.record_kv_progress(end=end)
-                    # Cached prefix positions are canonical for the validated codec;
-                    # freshly computed positions are copied from the actual forward.
-                    if context.owns_aux:
+                    # Ordinary AR positions already exist in the Host buffer.
+                    # Overrides/unknown constructors still capture actual positions.
+                    if context.owns_aux and not canonical_positions:
                         context.record_positions(
                             forward_batch.positions[offset : offset + extend_len],
                             start=end - extend_len,
@@ -737,14 +803,30 @@ class CaptureCoordinator:
             offset += extend_len
         if teacher_indices:
             try:
-                rows = capture_teacher(
-                    logits_output.next_token_logits,
-                    self.teacher.vocab_size,
-                    teacher_indices,
-                    topk_backend=self.config.teacher_topk_backend,
-                )
-                for row, (req, record, position) in enumerate(teacher_records):
-                    record.context.record_teacher(rows, row=row, position=position)
+                if self.teacher_batcher is not None:
+                    self.teacher_batcher.append(
+                        getattr(logits_output, self.codec.teacher.output_field, None),
+                        teacher_indices,
+                        [
+                            (record.context, position)
+                            for _, record, position in teacher_records
+                        ],
+                    )
+                    self._count("teacher_ring_enqueues")
+                else:
+                    rows = capture_teacher(
+                        logits_output.next_token_logits,
+                        self.teacher.vocab_size,
+                        teacher_indices,
+                        topk_backend=self.config.teacher_topk_backend,
+                    )
+                    for row, (req, record, position) in enumerate(teacher_records):
+                        record.context.record_teacher(rows, row=row, position=position)
+            except TeacherRingFull:
+                self._count("teacher_ring_backpressure")
+                for req, record, _ in teacher_records:
+                    if req.training_capture_context is record:
+                        self._fail_request(req, record, "teacher_ring_backpressure")
             except Exception:
                 logger.exception("Training capture teacher row collection failed")
                 for req, record, _ in teacher_records:
@@ -914,11 +996,15 @@ class CaptureCoordinator:
                     position=start,
                     tokens=[input_row[0]] + outputs[step.batch_row][:count],
                 )
-                if context.owns_kv:
+                if context.owns_kv and self.config.kv_source == "device":
                     context.export_kv(
                         self.exporter,
                         ticket.cache_locs[row_start : row_start + kv_count],
                         end=start + kv_count,
+                    )
+                elif context.owns_kv:
+                    context.defer_kv_progress(
+                        end=start + kv_count, device=self.resources.device
                     )
                 else:
                     context.record_kv_progress(end=start + kv_count)
@@ -952,6 +1038,7 @@ class CaptureCoordinator:
             )
 
     def after_result(self, ticket: CaptureBatch | None, *, requests=()):
+        self._drain_l2_releases()
         if self.admission.latency is not None:
             from sglang.srt.training_capture.latency import request_latency
 
@@ -981,7 +1068,26 @@ class CaptureCoordinator:
                 except Exception:
                     self._fail_request(req, record, "token_alignment_failed")
 
-    def on_release(self, req):
+    def prepare_l2(self, req, committed):
+        record = req.training_capture_context
+        if record is None or record.invalid_reason or not record.context.owns_kv:
+            return
+        try:
+            if committed != record.context.kv_end:
+                raise ContractError(
+                    "HiCache committed prefix differs from captured KV coverage"
+                )
+            lease = self.l2_exporter.acquire_transient(
+                req,
+                valid_tokens=committed,
+                source_stream=record.context.kv_source_stream,
+            )
+            record.context.bind_l2_snapshot(self.l2_exporter, lease)
+            self._count("l2_transient_leases")
+        except Exception:
+            self._fail_request(req, record, "l2_staging_failed")
+
+    def on_release(self, req, *, after_cache=False):
         record = req.training_capture_context
         if record is None:
             return
@@ -1001,6 +1107,8 @@ class CaptureCoordinator:
                 req, record, record.invalid_reason or "request_aborted_or_retracted"
             )
             return
+        if self.config.kv_source == "hicache_l2" and not after_cache:
+            return
         try:
             self._commit(req, record)
             if self.enable_overlap or record.provenance.capture_mode in (
@@ -1018,6 +1126,18 @@ class CaptureCoordinator:
                 )
             else:
                 reason = "stop_string"
+            if (
+                self.config.kv_source == "hicache_l2"
+                and record.context.owns_kv
+                and record.context.l2_lease is None
+            ):
+                committed = req.effective_kv_committed_len()
+                if committed != record.context.kv_end:
+                    raise ContractError(
+                        "HiCache committed prefix differs from captured KV coverage"
+                    )
+                lease = self.l2_exporter.acquire(req, valid_tokens=committed)
+                record.context.bind_l2_snapshot(self.l2_exporter, lease)
             record.context.seal(reason)
             self._count("sealed")
             self._detach(req, record)
@@ -1048,10 +1168,17 @@ class CaptureCoordinator:
             self._fail_request(req, req.training_capture_context, reason)
 
     def on_idle(self):
+        self._drain_l2_releases()
         if self.work.unfinished_tasks:
             # The idle scheduler polls in Python. Yield the GIL so the writer
             # can reacquire it between CPU tensor checks and hashing calls.
             time.sleep(0)
+
+    def _drain_l2_releases(self):
+        if self.l2_exporter is not None:
+            released = self.l2_exporter.drain_releases()
+            if released:
+                self._count("l2_leases_released")
 
     def _retire(self, record, *, complete):
         with self.lock:
@@ -1073,7 +1200,8 @@ class CaptureCoordinator:
             self._retire(
                 record,
                 complete=record.transfer_complete
-                and record.slot.storage.data_ptr() not in self.store.quarantined,
+                and record.slot.storage.data_ptr()
+                not in (self.writer_process or self.store).quarantined,
             )
         self.writer.recover()
         with self.lock:
@@ -1096,6 +1224,53 @@ class CaptureCoordinator:
                 and now - record.started > self.config.max_capture_seconds
             ):
                 raise ContractError("capture expired before publication")
+
+    def _write_snapshot(self, record):
+        metadata = {
+            "dataset_id": record.lease.dataset_id,
+            "sample_id": record.lease.sample_id,
+            "generation_id": record.lease.generation_id,
+            "teacher": self.teacher,
+            "kv": self.kv,
+            "provenance": record.provenance,
+            "contract_id": self.config.contract_id,
+        }
+        callbacks = {
+            "check_current": lambda: self._check_publication(record),
+            "on_prepared": lambda lease, data: self._publication_prepared(
+                record, lease, data
+            ),
+        }
+        if self.writer_process is not None:
+            self._check_publication(record)
+            self.writer_process.publish(
+                HostReadyCapture(
+                    slot_id=self.writer_process.indices[id(record.slot)],
+                    slot_epoch=record.slot.epoch,
+                    metadata=SnapshotMetadata(
+                        sequence=record.context.sealed.sequence, **metadata
+                    ),
+                    valid_kv_tokens=record.context.sealed.valid_kv_tokens,
+                    lease=record.lease,
+                ),
+                **callbacks,
+            )
+            self._count("snapshot_built")
+        else:
+            manifest, tensors = self.writer.timings.call(
+                "snapshot_build",
+                record.context.prepare_snapshot,
+                payload_hasher=self.store.payload_hasher,
+                **metadata,
+            )
+            self._count("snapshot_built")
+            self.writer.write(
+                manifest,
+                tensors,
+                record.slot.manifest_buffer,
+                record.lease,
+                **callbacks,
+            )
 
     def _writer_loop(self):
         # Match the CUDA worker's CPU budget in this thread's OpenMP context.
@@ -1140,31 +1315,7 @@ class CaptureCoordinator:
                         record.lease, record.invalid_reason or "capture_failed"
                     )
                 else:
-                    manifest, tensors = self.writer.timings.call(
-                        "snapshot_build",
-                        record.context.prepare_snapshot,
-                        payload_hasher=self.store.payload_hasher,
-                        dataset_id=record.lease.dataset_id,
-                        sample_id=record.lease.sample_id,
-                        generation_id=record.lease.generation_id,
-                        teacher=self.teacher,
-                        kv=self.kv,
-                        provenance=record.provenance,
-                        contract_id=self.config.contract_id,
-                    )
-                    self._count("snapshot_built")
-                    self.writer.write(
-                        manifest,
-                        tensors,
-                        record.slot.manifest_buffer,
-                        record.lease,
-                        check_current=lambda record=record: self._check_publication(
-                            record
-                        ),
-                        on_prepared=lambda lease, data, record=record: (
-                            self._publication_prepared(record, lease, data)
-                        ),
-                    )
+                    self._write_snapshot(record)
                     self._count("ready")
                     logger.info(
                         "Training sample READY: sample_id=%s generation_id=%s",
@@ -1183,6 +1334,9 @@ class CaptureCoordinator:
                     type(error).__name__,
                 )
                 logger.debug("Training capture write details", exc_info=True)
+                if self.writer_process is not None and self.writer_process.failed:
+                    with self.lock:
+                        self.disabled_reason = "writer_process_failed"
                 # Cleanup unlinks before directory fsync; absence cannot disprove
                 # a committed publication. Keep the exact prepared bytes instead.
                 if record.publication is not None:
@@ -1228,6 +1382,7 @@ class CaptureCoordinator:
         if self.writer_thread.is_alive():
             logger.error("Capture writer did not stop; retaining registered buffers")
             return
+        self._drain_l2_releases()
         # Stop CUDA and transport work before releasing quarantined storage.
         self.resources.close()
         self.closed = True

@@ -1755,6 +1755,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 else None
             ),
             input_token_logprobs=output.input_token_logprobs,
+            training_capture_hidden_states=(
+                output.training_capture_hidden_states[:logits_rows]
+                if output.training_capture_hidden_states is not None
+                else None
+            ),
             input_top_logprobs_val=output.input_top_logprobs_val,
             input_top_logprobs_idx=output.input_top_logprobs_idx,
             input_token_ids_logprobs_val=output.input_token_ids_logprobs_val,

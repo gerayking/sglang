@@ -126,30 +126,35 @@ class ClientDiagnostics:
 
 
 def scheduler_gc_events(log):
-    """Read the existing single-rank SGLANG_LOG_GC start/end messages."""
-    pattern = re.compile(r"GC (start|end): Time ([0-9.]+) \| Generation ([0-9]+)")
+    """Read SGLANG_LOG_GC start/end messages from one or more TP ranks."""
+    pattern = re.compile(
+        r"(?:(TP[0-9]+)\]\s+)?GC (start|end): Time ([0-9.]+) "
+        r"\| Generation ([0-9]+)"
+    )
     pending = {}
     events = []
     unmatched = 0
     for match in pattern.finditer(log):
-        phase, stamp, generation = match.groups()
+        rank, phase, stamp, generation = match.groups()
         stamp, generation = float(stamp), int(generation)
+        key = (rank, generation)
         if phase == "start":
-            if generation in pending:
-                raise ValueError("overlapping scheduler GC starts; require one rank")
-            pending[generation] = stamp
-        elif generation in pending:
-            start = pending.pop(generation)
+            if key in pending:
+                raise ValueError("overlapping scheduler GC starts for one rank")
+            pending[key] = stamp
+        elif key in pending:
+            start = pending.pop(key)
             if not math.isfinite(stamp) or stamp < start:
                 raise ValueError("invalid scheduler GC clock interval")
-            events.append(
-                {
-                    "kind": "scheduler_gc",
-                    "start_unix_seconds": start,
-                    "end_unix_seconds": stamp,
-                    "generation": generation,
-                }
-            )
+            event = {
+                "kind": "scheduler_gc",
+                "start_unix_seconds": start,
+                "end_unix_seconds": stamp,
+                "generation": generation,
+            }
+            if rank is not None:
+                event["rank"] = rank
+            events.append(event)
         else:
             unmatched += 1
     return {

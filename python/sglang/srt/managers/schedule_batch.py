@@ -874,6 +874,8 @@ class Req(ReqDllmMixin):
         self.training_capture_context = None
         self.training_capture_pd = None
         self.training_capture_finalize = None
+        self.training_capture_prepare_l2 = None
+        self.training_capture_finalize_after_cache = None
         self.training_capture_latency = None
         self.training_capture_route = None
         self.training_capture_cancel = None

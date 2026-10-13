@@ -376,11 +376,13 @@ class TestCaptureCoordinator(CustomTestCase):
     def test_weight_update_preserves_already_detached_snapshot(self):
         req, record = self.sealed_request("sealed-before-update")
         entered, release = threading.Event(), threading.Event()
+        materialize = record.context.wait_for_copies
 
         def wait_for_copy():
             entered.set()
             if not release.wait(5):
                 raise TimeoutError("copy gate")
+            materialize()
 
         try:
             with patch.object(
@@ -419,6 +421,7 @@ class TestCaptureCoordinator(CustomTestCase):
         ):
             with self.subTest(field=field):
                 req, record = self.sealed_request("corrupt-" + field)
+                record.context.wait_for_copies()
                 tensor = record.slot.tensors[field]
                 if field == "loss_mask":
                     tensor[0] = 1
@@ -537,6 +540,25 @@ class TestCaptureCoordinator(CustomTestCase):
             torch.testing.assert_close(
                 tensors[name], source[fixture.slots[:3]], rtol=0, atol=0
             )
+
+    def test_canonical_forward_reuses_positions_without_copies(self):
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        fixture = OverlapCaptureFixture(self.coordinator, self.request("positions"))
+        context = fixture.record.context
+        with patch.object(
+            context, "record_positions", wraps=context.record_positions
+        ) as copy:
+            fixture.forward(2, positions_are_canonical=True)
+            copy.assert_not_called()
+        self.assertEqual(context.slot.tensors["position_ids"][:2].tolist(), [0, 1])
+
+    def test_unknown_position_constructor_still_records_actual_values(self):
+        self.wait_until(lambda: len(self.coordinator.available) == 1)
+        fixture = OverlapCaptureFixture(self.coordinator, self.request("overrides"))
+        fixture.forward(2, positions=torch.tensor([6, 7]))
+        self.assertEqual(
+            fixture.record.context.slot.tensors["position_ids"][:2].tolist(), [6, 7]
+        )
 
     def test_overlap_at_exact_capacity_preserves_all_required_teacher_rows(self):
         from sglang.srt.managers.schedule_batch import FINISH_LENGTH

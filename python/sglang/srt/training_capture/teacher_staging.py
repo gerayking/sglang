@@ -2,9 +2,40 @@
 
 from __future__ import annotations
 
+import threading
+
 import torch
 from sglang.srt.training_capture.protocol import ContractError
 from sglang.srt.training_capture.teacher import TeacherRows
+
+
+class TeacherCompletion:
+    """Transfer receipts shared with workers, independent of the token ledger."""
+
+    def __init__(self):
+        self.condition = threading.Condition()
+        self.pending = 0
+        self.error = None
+
+    def reserve(self):
+        with self.condition:
+            self.pending += 1
+
+    def finish(self, error=None):
+        with self.condition:
+            if self.pending < 1:
+                raise ContractError("async teacher completion has no reservation")
+            if error is not None and self.error is None:
+                self.error = error
+            self.pending -= 1
+            self.condition.notify_all()
+
+    def wait(self):
+        with self.condition:
+            while self.pending:
+                self.condition.wait()
+            if self.error is not None:
+                raise ContractError("async teacher compaction failed") from self.error
 
 
 class TeacherStaging:
@@ -75,6 +106,53 @@ class TeacherStaging:
                 self.start = self.end
             elif self.end - self.start == self.capacity:
                 self.flush()
+
+    def reserve(self, *, start: int, count: int):
+        """Reserve final row offsets before a background stream fills them."""
+        if (
+            start != self.end
+            or count < 1
+            or self.start != 0
+            or start + count > self.capacity
+        ):
+            raise ContractError("async teacher staging must cover the full sample")
+        self.end += count
+
+    def write_reserved(
+        self, rows: TeacherRows, *, row: int, start: int, count: int = 1
+    ):
+        if (
+            count < 1
+            or not 0 <= start < start + count <= self.end
+            or row < 0
+            or row + count > rows.logits.shape[0]
+        ):
+            raise ContractError("async teacher result is outside its reservation")
+        sources = {
+            "teacher_topk_ids": rows.token_ids,
+            "teacher_topk_logits": rows.logits,
+            "teacher_logsumexp": rows.logsumexp,
+        }
+        stream = (
+            torch.cuda.current_stream(self.device)
+            if self.device.type == "cuda"
+            else None
+        )
+        for name, source in sources.items():
+            target = self.device_tensors[name]
+            if (
+                source.device != self.device
+                or source.dtype != target.dtype
+                or source.shape[1:] != target.shape[1:]
+            ):
+                raise ContractError("async teacher result differs from its staging")
+            target[start : start + count].copy_(source[row : row + count])
+        self.stream = stream
+
+    def truncate(self, end: int):
+        if not self.start <= end <= self.end:
+            raise ContractError("teacher staging truncation is outside its rows")
+        self.end = end
 
     def flush(self):
         """Caller selects the producer stream and fences partial failures."""

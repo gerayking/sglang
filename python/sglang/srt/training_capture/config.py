@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 import msgspec
+from sglang.srt.training_capture.codec import get_codec
 from sglang.srt.training_capture.protocol import (
     ContractError,
     Digest,
@@ -97,11 +98,17 @@ class CaptureConfig(StrictStruct):
     max_sample_tokens: Annotated[int, msgspec.Meta(ge=2, le=2147483647)] = 8192
     max_inflight_samples: Positive = 4
     max_host_bytes: Positive = 512 << 20
+    kv_source: Literal["device", "hicache_l2"] = "device"
     kv_d2h_batch_tokens: Positive = 1
     kv_export_backend: Literal["torch", "hicache"] = "torch"
     teacher_d2h_batch_tokens: Positive = 1
     teacher_topk_backend: Literal["torch", "flashinfer"] = "torch"
+    teacher_capture_backend: Literal["inline", "async_ring", "final_hidden"] = "inline"
+    teacher_gpu_ring_rows: Positive = 32
+    teacher_background_batch_rows: Positive = 16
     payload_hash_workers: Annotated[int, msgspec.Meta(ge=1, le=8)] = 1
+    snapshot_writer_backend: Literal["thread", "process"] = "thread"
+    writer_process_timeout_seconds: Annotated[float, msgspec.Meta(gt=0)] = 120.0
     max_device_bytes: Nonnegative = 0
     manifest_buffer_bytes: Positive = 1 << 20
     storage_chunk_tokens: Positive = 256
@@ -117,6 +124,19 @@ class CaptureConfig(StrictStruct):
         if source.stat().st_size > 1 << 20:
             raise ContractError("capture configuration is too large")
         config = msgspec.json.decode(source.read_bytes(), type=cls)
+        codec = get_codec(config.contract_id)
+        if (codec.teacher.kind == "final_hidden") != (
+            config.teacher_capture_backend == "final_hidden"
+        ):
+            raise ContractError("teacher backend and capture contract disagree")
+        if codec.teacher.kind == "final_hidden" and (
+            config.kv_source != "hicache_l2"
+            or config.snapshot_writer_backend != "process"
+            or not config.max_device_bytes
+        ):
+            raise ContractError(
+                "final hidden requires L2, a process writer and a device budget"
+            )
         if not config.selected_layer_ids or len(config.selected_layer_ids) != len(
             set(config.selected_layer_ids)
         ):
@@ -128,6 +148,7 @@ class CaptureConfig(StrictStruct):
                 config.capture_lease_seconds,
                 config.max_capture_seconds,
                 config.http_timeout_seconds,
+                config.writer_process_timeout_seconds,
             )
         ):
             raise ContractError("capture limits must be finite")
@@ -135,12 +156,33 @@ class CaptureConfig(StrictStruct):
             raise ContractError("capture requires a Catalog HTTP endpoint")
         if not Path(config.journal_directory).is_absolute():
             raise ContractError("capture journal directory must be absolute")
-        if config.kv_d2h_batch_tokens > 1 and not config.max_device_bytes:
+        if (
+            config.kv_source == "device"
+            and config.kv_d2h_batch_tokens > 1
+            and not config.max_device_bytes
+        ):
             raise ContractError("batched KV D2H requires a device staging budget")
-        if config.kv_export_backend == "hicache" and not config.max_device_bytes:
+        if config.kv_source == "hicache_l2" and (
+            config.kv_export_backend != "torch" or config.kv_d2h_batch_tokens != 1
+        ):
+            raise ContractError(
+                "HiCache L2 capture does not use the device KV export backend"
+            )
+        if (
+            config.kv_source == "device"
+            and config.kv_export_backend == "hicache"
+            and not config.max_device_bytes
+        ):
             raise ContractError("HiCache KV export requires a device metadata budget")
         if config.teacher_d2h_batch_tokens > 1 and not config.max_device_bytes:
             raise ContractError("batched teacher D2H requires a device staging budget")
+        if config.teacher_capture_backend == "async_ring":
+            if not config.max_device_bytes:
+                raise ContractError("async teacher capture requires a device budget")
+            if config.teacher_background_batch_rows > config.teacher_gpu_ring_rows:
+                raise ContractError(
+                    "teacher background batch exceeds the raw-logit ring"
+                )
         if config.adaptive is not None:
             config.adaptive.validate()
         return config
@@ -169,10 +211,28 @@ def validate_capture_server_args(args) -> None:
     """Called during ServerArgs validation, before loading target weights."""
     if args.training_capture_config is None:
         return
-    CaptureConfig.load(args.training_capture_config)
+    config = CaptureConfig.load(args.training_capture_config)
     from sglang.srt.environ import envs
 
     unsupported = {
+        "experimental final hidden outside single-rank AR": (
+            config.teacher_capture_backend == "final_hidden"
+            and (
+                args.tp_size != 1
+                or args.pp_size != 1
+                or args.disaggregation_mode != "null"
+                or args.speculative_algorithm is not None
+            )
+        ),
+        "process snapshot writer with TP/PP, PD or speculative decoding": (
+            config.snapshot_writer_backend == "process"
+            and (
+                args.tp_size != 1
+                or args.pp_size != 1
+                or args.disaggregation_mode != "null"
+                or args.speculative_algorithm is not None
+            )
+        ),
         "DP or context parallelism": args.dp_size != 1
         or args.attn_cp_size != 1
         or args.dcp_size != 1
@@ -199,9 +259,25 @@ def validate_capture_server_args(args) -> None:
         "custom weight or forward hooks": bool(args.custom_weight_loader)
         or bool(args.forward_hooks),
         "embedding/encoder serving": args.is_embedding or args.encoder_only,
+        "async teacher capture with speculative decoding or PD": (
+            config.teacher_capture_backend == "async_ring"
+            and (
+                args.speculative_algorithm is not None
+                or args.disaggregation_mode != "null"
+            )
+        ),
     }
     rejected = [name for name, enabled in unsupported.items() if enabled]
     if rejected:
         raise ValueError(
             "training capture does not yet support: " + ", ".join(rejected)
         )
+    if config.kv_source == "hicache_l2":
+        if not args.enable_hierarchical_cache:
+            raise ValueError("HiCache L2 capture requires --enable-hierarchical-cache")
+        if args.hicache_write_policy != "write_through":
+            raise ValueError(
+                "HiCache L2 capture requires --hicache-write-policy write_through"
+            )
+        if args.page_size not in (None, 1):
+            raise ValueError("HiCache L2 capture currently requires --page-size 1")

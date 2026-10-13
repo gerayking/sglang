@@ -5,22 +5,26 @@ from __future__ import annotations
 from contextlib import nullcontext
 
 import torch
+from sglang.srt.training_capture.codec import TOP128_CODEC
 from sglang.srt.training_capture.host_pool import HostSlot
 from sglang.srt.training_capture.kv_exporter import SelectedLayerKVExporter
 from sglang.srt.training_capture.kv_staging import KVStaging
 from sglang.srt.training_capture.protocol import (
     ContractError,
     SequenceInfo,
-    aux_specs,
     validate_tensors,
 )
 from sglang.srt.training_capture.snapshot import (
+    SealedCapture,
     SnapshotMetadata,
     prepare_snapshot,
     prepare_snapshot_partition,
 )
 from sglang.srt.training_capture.teacher import TeacherRows
-from sglang.srt.training_capture.teacher_staging import TeacherStaging
+from sglang.srt.training_capture.teacher_staging import (
+    TeacherCompletion,
+    TeacherStaging,
+)
 from sglang.srt.training_capture.topology import CapturePartition
 
 
@@ -40,6 +44,8 @@ class RequestCaptureContext:
         max_tokens: int,
         vocab_size: int,
         partition: CapturePartition | None = None,
+        teacher_batcher=None,
+        codec=TOP128_CODEC,
     ):
         if not prompt_ids or len(prompt_ids) >= max_tokens:
             raise ContractError(
@@ -48,6 +54,7 @@ class RequestCaptureContext:
         if any(not 0 <= token < vocab_size for token in prompt_ids):
             raise ContractError("prompt token outside target vocabulary")
         self.partition = partition
+        self.codec = codec
         self.owns_aux = partition is None or partition.include_aux
         self.owns_kv = partition is None or bool(partition.heads)
         active = partition is None or partition.active
@@ -55,7 +62,7 @@ class RequestCaptureContext:
             raise ContractError("context storage differs from payload ownership")
         if partition is not None and active:
             expected = (
-                set(aux_specs(max_tokens, max_tokens)) if self.owns_aux else set()
+                set(codec.aux_specs(max_tokens, max_tokens)) if self.owns_aux else set()
             )
             for heads in partition.heads:
                 for component in ("k", "v"):
@@ -80,7 +87,10 @@ class RequestCaptureContext:
         self.max_tokens = max_tokens
         self.vocab_size = vocab_size
         self.kv_end = 0
+        self.kv_source_stream = None
         self.teacher_rows = 0
+        self.teacher_batcher = teacher_batcher
+        self.teacher_completion = TeacherCompletion()
         self.last_event = None
         self.last_stream = None
         self.kv_staging = (
@@ -93,10 +103,22 @@ class RequestCaptureContext:
             if slot is not None and slot.teacher_device_tensors is not None
             else None
         )
+        if teacher_batcher is not None and (
+            not self.owns_aux
+            or self.teacher_staging is None
+            or self.teacher_staging.capacity < max_tokens
+        ):
+            raise ContractError(
+                "async teacher capture requires full request-owned device staging"
+            )
         self.transfer_uncertain = False
+        self.l2_exporter = None
+        self.l2_lease = None
+        self.l2_materialized = False
         self.state = "COLLECTING"
         self.failure_reason = None
         self.sequence = None
+        self.sealed = None
         if self.owns_aux:
             self.slot.tensors["position_ids"][:max_tokens].copy_(
                 torch.arange(max_tokens)
@@ -107,6 +129,16 @@ class RequestCaptureContext:
     def _collecting(self):
         if self.state != "COLLECTING":
             raise ContractError("capture is no longer collecting")
+
+    @property
+    def transfer_uncertain(self):
+        return self._transfer_uncertain or bool(
+            self.teacher_staging and self.teacher_staging.transfer_uncertain
+        )
+
+    @transfer_uncertain.setter
+    def transfer_uncertain(self, value):
+        self._transfer_uncertain = value
 
     def _sealed(self):
         if self.state != "SEALED":
@@ -159,6 +191,28 @@ class RequestCaptureContext:
             )
         self.kv_end = end
 
+    def defer_kv_progress(self, *, end: int, device=None):
+        """Record coverage whose KV bytes will be materialized from HiCache L2."""
+        self._collecting()
+        if not self.owns_kv or not self.kv_end <= end <= self.max_tokens:
+            raise ContractError("invalid deferred L2 KV coverage")
+        if device is not None and torch.device(device).type == "cuda":
+            self.kv_source_stream = torch.cuda.current_stream(device)
+        self.kv_end = end
+
+    def bind_l2_snapshot(self, exporter, lease):
+        """Attach a protected, completed-prefix L2 source before sealing."""
+        self._collecting()
+        if (
+            not self.owns_kv
+            or self.l2_lease is not None
+            or lease.host_indices.numel() != self.kv_end
+        ):
+            lease.release()
+            raise ContractError("L2 snapshot lease differs from KV coverage")
+        self.l2_exporter = exporter
+        self.l2_lease = lease
+
     def record_positions(self, positions: torch.Tensor, *, start: int):
         self._collecting()
         if not self.owns_aux:
@@ -188,14 +242,7 @@ class RequestCaptureContext:
         self._collecting()
         if not self.owns_aux:
             raise ContractError("only the aux owner records teacher payloads")
-        if (
-            count < 1
-            or position != self.prompt_length + self.teacher_rows
-            or position + count > self.max_tokens
-            or position + count - 1 > self.kv_end
-            or row < 0
-            or row + count > rows.logits.shape[0]
-        ):
+        if row < 0 or row + count > rows.logits.shape[0]:
             raise ContractError(
                 "teacher range is missing, duplicated, or shifted: "
                 f"count={count} position={position} "
@@ -203,6 +250,7 @@ class RequestCaptureContext:
                 f"max_tokens={self.max_tokens} kv_end={self.kv_end} "
                 f"row={row} available_rows={rows.logits.shape[0]}"
             )
+        self._validate_teacher_range(position=position, count=count)
         index = self.teacher_rows
         try:
             if self.teacher_staging is not None:
@@ -230,6 +278,45 @@ class RequestCaptureContext:
                 else rows.logits.device
             )
         self.teacher_rows += count
+
+    def _validate_teacher_range(self, *, position: int, count: int):
+        if (
+            count < 1
+            or position != self.prompt_length + self.teacher_rows
+            or position + count > self.max_tokens
+            or position + count - 1 > self.kv_end
+        ):
+            raise ContractError(
+                "teacher range is missing, duplicated, or shifted: "
+                f"count={count} position={position} "
+                f"expected_position={self.prompt_length + self.teacher_rows} "
+                f"max_tokens={self.max_tokens} kv_end={self.kv_end}"
+            )
+
+    def validate_async_teacher(self, *, position: int):
+        self._collecting()
+        if self.teacher_batcher is None or not self.owns_aux:
+            raise ContractError("request does not use async teacher capture")
+        self._validate_teacher_range(position=position, count=1)
+
+    def reserve_async_teacher(self, *, position: int):
+        self.validate_async_teacher(position=position)
+        index = self.teacher_rows
+        self.teacher_staging.reserve(start=index, count=1)
+        self.teacher_rows += 1
+        self.teacher_completion.reserve()
+        return index
+
+    def write_async_teacher(self, rows: TeacherRows, *, row: int, start: int):
+        self.teacher_staging.write_reserved(rows, row=row, start=start)
+
+    def finish_async_teacher(self, error: BaseException | None):
+        self.teacher_completion.finish(error)
+
+    def _wait_for_async_teacher(self):
+        if self.teacher_batcher is None:
+            return
+        self.teacher_completion.wait()
 
     def trim_terminal_prefix(self):
         """Discard lookahead/verify suffixes past the scheduler's output boundary."""
@@ -298,25 +385,25 @@ class RequestCaptureContext:
         ):
             raise ContractError("cannot seal an incomplete response or KV prefix")
         self._flush_kv()
-        self._flush_staging(self.teacher_staging)
-        if self.owns_aux:
-            # The teacher ledger already checked every position. Materialize
-            # only the committed prefix after speculative/lookahead trimming.
-            torch.arange(
-                self.prompt_length,
-                n,
-                out=self.slot.tensors["logits_positions"][:r],
-            )
-            self.slot.tensors["token_ids"][:n].copy_(
-                torch.tensor(self.token_ids, dtype=torch.int32)
-            )
-            self.slot.tensors["loss_mask"][self.prompt_length : n] = 1
-            self.slot.tensors["kv_valid"][: self.kv_end] = 1
+        if self.teacher_batcher is None:
+            self._flush_staging(self.teacher_staging)
+        else:
+            try:
+                self.teacher_batcher.seal(self.teacher_staging)
+            except Exception:
+                self.transfer_uncertain = True
+                raise
         self.sequence = SequenceInfo(
             prompt_length=self.prompt_length,
             response_length=r,
             total_length=n,
             stop_reason=stop_reason,
+        )
+        self.sealed = SealedCapture(
+            sequence=self.sequence,
+            token_ids=tuple(self.token_ids),
+            valid_kv_tokens=self.kv_end,
+            teacher_rows=r,
         )
         self.state = "SEALED"
 
@@ -341,8 +428,22 @@ class RequestCaptureContext:
         if self.state in ("COLLECTING", "SEALED"):
             self.state = "FAILED"
             self.failure_reason = reason
+        if self.l2_lease is not None:
+            self.l2_lease.release()
+            self.l2_lease = None
 
     def wait_for_copies(self):
+        self._wait_for_async_teacher()
+        if self.teacher_batcher is not None and self.state == "SEALED":
+            if self.teacher_staging.end != self.teacher_rows:
+                self.teacher_staging.truncate(self.teacher_rows)
+            self._flush_staging(self.teacher_staging)
+        elif (
+            self.teacher_staging is not None and self.teacher_staging.stream is not None
+        ):
+            # An aborted hidden capture still owns its producer's D2D writes.
+            with torch.cuda.stream(self.teacher_staging.stream):
+                self._record_completion(self.teacher_staging.device)
         if self.transfer_uncertain:
             raise ContractError("CUDA copy completion is uncertain")
         if self.last_event is not None:
@@ -351,11 +452,37 @@ class RequestCaptureContext:
             except Exception:
                 self.transfer_uncertain = True
                 raise
+        if self.l2_lease is not None:
+            lease, self.l2_lease = self.l2_lease, None
+            try:
+                self.l2_exporter.materialize(lease, self.slot.tensors, end=self.kv_end)
+                self.l2_materialized = True
+            except Exception:
+                self.transfer_uncertain = True
+                raise
+
+        if self.state == "SEALED" and self.slot is not None and not self.slot.host_ready:
+            sealed = self.sealed
+            if self.owns_aux:
+                n, p = sealed.sequence.total_length, sealed.sequence.prompt_length
+                torch.arange(
+                    p,
+                    n,
+                    out=self.slot.tensors["logits_positions"][: sealed.teacher_rows],
+                )
+                self.slot.tensors["token_ids"][:n].copy_(
+                    torch.tensor(sealed.token_ids, dtype=torch.int32)
+                )
+                self.slot.tensors["loss_mask"][:n].zero_()
+                self.slot.tensors["loss_mask"][p:n] = 1
+                self.slot.tensors["kv_valid"][:n].zero_()
+                self.slot.tensors["kv_valid"][: sealed.valid_kv_tokens] = 1
+            self.slot.host_ready = True
 
     def snapshot(self, **metadata):
         """Return a fully validated snapshot for direct consumers."""
         result = self.prepare_snapshot(**metadata)
-        validate_tensors(*result)
+        validate_tensors(*result, _codec=self.codec)
         self._sealed()
         return result
 
@@ -368,9 +495,9 @@ class RequestCaptureContext:
         self._sealed()
         self.wait_for_copies()
         result = prepare_snapshot(
-            SnapshotMetadata(sequence=self.sequence, **metadata),
+            SnapshotMetadata(sequence=self.sealed.sequence, **metadata),
             self.slot.tensors,
-            valid_kv_tokens=self.kv_end,
+            valid_kv_tokens=self.sealed.valid_kv_tokens,
             payload_hasher=payload_hasher,
         )
         self._sealed()
@@ -384,11 +511,11 @@ class RequestCaptureContext:
         self._sealed()
         self.wait_for_copies()
         result = prepare_snapshot_partition(
-            SnapshotMetadata(sequence=self.sequence, **metadata),
+            SnapshotMetadata(sequence=self.sealed.sequence, **metadata),
             self.slot.tensors,
-            valid_kv_tokens=self.kv_end,
+            valid_kv_tokens=self.sealed.valid_kv_tokens,
             partition=self.partition,
-            token_ids=self.token_ids,
+            token_ids=self.sealed.token_ids,
             payload_hasher=payload_hasher,
         )
         self._sealed()
