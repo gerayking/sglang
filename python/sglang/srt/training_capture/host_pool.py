@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 import threading
 from typing import Protocol
 
@@ -51,7 +52,7 @@ class HostBufferPool:
         max_tokens: int,
         slots: int,
         max_bytes: int,
-        registrar: BufferRegistrar,
+        registrar: BufferRegistrar | None,
         manifest_bytes: int = 1 << 20,
         pin_memory: bool = True,
         device: torch.device | None = None,
@@ -60,6 +61,7 @@ class HostBufferPool:
         teacher_d2h_batch_tokens: int = 1,
         max_device_bytes: int = 0,
         partition: CapturePartition | None = None,
+        shared: bool = False,
     ):
         if min(max_tokens, slots, max_bytes, manifest_bytes) <= 0:
             raise ValueError("Host pool sizes must be positive")
@@ -168,10 +170,45 @@ class HostBufferPool:
         self.device_allocated_bytes = 0
         self.device_limit_bytes = max_device_bytes
         self.closed = False
+        self.shared_arena = None
+        self.shared_pinned = False
+        self.shared_writer_active = False
+        self.layout = layout
+        self.manifest_offset = manifest_offset
+        self.slot_bytes = slot_bytes
         try:
-            for _ in range(slots):
-                storage = torch.empty(
-                    slot_bytes, dtype=torch.uint8, pin_memory=pin_memory
+            if shared:
+                shm = os.statvfs("/dev/shm")
+                required = (
+                    (slot_bytes * slots + shm.f_frsize - 1)
+                    // shm.f_frsize
+                    * shm.f_frsize
+                )
+                if required > shm.f_bavail * shm.f_frsize:
+                    raise CaptureError(
+                        "insufficient /dev/shm space for shared Host pool"
+                    )
+                # Only CPU storage crosses IPC. Pin the shared mapping in the
+                # serving process; the writer registers its own mapping with Store.
+                self.shared_arena = torch.empty(
+                    slot_bytes * slots, dtype=torch.uint8
+                ).share_memory_()
+                if pin_memory:
+                    result = torch.cuda.cudart().cudaHostRegister(
+                        self.shared_arena.data_ptr(), self.shared_arena.numel(), 0
+                    )
+                    if int(result) != 0:
+                        raise CaptureError(f"shared Host pinning failed: {result}")
+                    self.shared_pinned = True
+            elif registrar is None:
+                raise ValueError("non-shared Host pool requires a registrar")
+            for index in range(slots):
+                storage = (
+                    self.shared_arena[index * slot_bytes : (index + 1) * slot_bytes]
+                    if shared
+                    else torch.empty(
+                        slot_bytes, dtype=torch.uint8, pin_memory=pin_memory
+                    )
                 )
                 views = {
                     name: storage[start : start + length]
@@ -205,7 +242,8 @@ class HostBufferPool:
                         for name, value in device_views.items()
                         if name in export_names
                     } or None
-                self.registrar.register(storage)
+                if self.registrar is not None:
+                    self.registrar.register(storage)
                 self.slots.append(slot)
                 self.allocated_bytes += slot_bytes
                 self.device_allocated_bytes += device_bytes
@@ -253,6 +291,8 @@ class HostBufferPool:
 
     def close(self) -> None:
         with self.lock:
+            if self.shared_writer_active:
+                raise CaptureError("cannot close Host pool before the writer stops")
             if any(slot.state != "free" for slot in self.slots):
                 raise CaptureError(
                     "cannot unregister buffers with outstanding or uncertain transfers"
@@ -260,8 +300,22 @@ class HostBufferPool:
             # Keep failed registrations referenced if unregister itself fails.
             while self.slots:
                 slot = self.slots[-1]
-                self.registrar.unregister(slot.storage)
+                if self.registrar is not None:
+                    self.registrar.unregister(slot.storage)
                 self.slots.pop()
+            self.unpin_shared()
             self.allocated_bytes = 0
             self.device_allocated_bytes = 0
             self.closed = True
+
+    def unpin_shared(self):
+        """Caller must first stop CUDA copies and the writer's transport."""
+        if self.shared_writer_active:
+            raise CaptureError("cannot release Host pins before the writer stops")
+        if self.shared_pinned:
+            result = torch.cuda.cudart().cudaHostUnregister(
+                self.shared_arena.data_ptr()
+            )
+            if int(result) != 0:
+                raise CaptureError(f"shared Host unpinning failed: {result}")
+            self.shared_pinned = False

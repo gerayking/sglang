@@ -63,6 +63,12 @@ class CohortCaptureCoordinator(CaptureCoordinator):
         self.control_group = allocator.group
         self.owns_control_group = owns_control_group
         self.exporter, self.pool = self.resources.exporter, self.resources.pool
+        self.l2_exporter = self.resources.l2_exporter
+        self.teacher_batcher = self.resources.teacher_batcher
+        if self.teacher_batcher is not None and capture_mode != "autoregressive":
+            raise ContractError(
+                "async teacher capture currently supports autoregressive serving"
+            )
         self.req_to_token = req_to_token
         self.capture_mode, self.enable_overlap = capture_mode, enable_overlap
         self.layout, self.partition = (
@@ -200,6 +206,11 @@ class CohortCaptureCoordinator(CaptureCoordinator):
                 "writer_age_seconds": age,
                 "stage_timings": writer["stage_timings"],
                 "host_pool": self._host_stats(),
+                "teacher_batcher": (
+                    self.teacher_batcher.stats()
+                    if self.teacher_batcher is not None
+                    else None
+                ),
                 "admission": admission,
                 "cohort_writer": writer,
                 "request_router": dict(self.request_router.counters),
@@ -255,9 +266,17 @@ class CohortCaptureCoordinator(CaptureCoordinator):
                 max_tokens=self.config.max_sample_tokens,
                 vocab_size=self.teacher.vocab_size,
                 partition=self.partition,
+                teacher_batcher=self.teacher_batcher,
             )
             req.training_capture_context = record
-            req.training_capture_finalize = self.on_release
+            if self.config.kv_source == "hicache_l2":
+                if getattr(self.l2_exporter, "requires_transient", False):
+                    req.training_capture_prepare_l2 = self.prepare_l2
+                req.training_capture_finalize_after_cache = lambda request: (
+                    self.on_release(request, after_cache=True)
+                )
+            else:
+                req.training_capture_finalize = self.on_release
             self.requests[cohort.lease.capture_id] = req
             self._count("admitted")
         except Exception:  # noqa: BLE001 - admission failure must not reject inference
@@ -288,10 +307,10 @@ class CohortCaptureCoordinator(CaptureCoordinator):
             self._refresh(req.training_capture_context)
         super().before_forward(reqs)
 
-    def on_release(self, req):
+    def on_release(self, req, *, after_cache=False):
         if req.training_capture_context is not None:
             self._refresh(req.training_capture_context)
-        super().on_release(req)
+        super().on_release(req, after_cache=after_cache)
 
     def after_result(self, ticket, *, requests=()):
         # PP relays committed tokens, not the rank-local forward ticket. Read the
@@ -406,6 +425,7 @@ class CohortCaptureCoordinator(CaptureCoordinator):
             self.service.set_admission_ready(False)
 
     def on_idle(self):
+        self._drain_l2_releases()
         if (
             self.work.unfinished_tasks
             or self.writer_actor.stats(include_timings=False)["pending"]
@@ -429,6 +449,7 @@ class CohortCaptureCoordinator(CaptureCoordinator):
         ):
             self._retained.add(self)
             return False
+        self._drain_l2_releases()
         try:
             self.resources.close()
             if self.owns_control_group:

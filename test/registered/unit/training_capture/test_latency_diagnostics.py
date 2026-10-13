@@ -238,6 +238,17 @@ class TestPauseCorrelation(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 scheduler_gc_events(text)
 
+    def test_scheduler_parser_accepts_interleaved_tensor_parallel_ranks(self):
+        parsed = scheduler_gc_events(
+            "[2026-10-10 10:00:00 TP0] GC start: Time 1000.0 | Generation 0\n"
+            "[2026-10-10 10:00:00 TP1] GC start: Time 1000.1 | Generation 0\n"
+            "[2026-10-10 10:00:00 TP0] GC end: Time 1000.2 | Generation 0\n"
+            "[2026-10-10 10:00:00 TP1] GC end: Time 1000.3 | Generation 0\n"
+        )
+        self.assertEqual(parsed["unmatched_starts"], 0)
+        self.assertEqual(parsed["unmatched_ends"], 0)
+        self.assertEqual([event["rank"] for event in parsed["events"]], ["TP0", "TP1"])
+
 
 class TestTokenizerGCObservation(unittest.TestCase):
     def test_structured_event_preserves_process_clock_and_generation(self):

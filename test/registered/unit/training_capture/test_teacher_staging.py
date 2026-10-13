@@ -87,6 +87,50 @@ class TestTeacherStaging(CustomTestCase):
         for name, source in self.expected.items():
             torch.testing.assert_close(self.slot.tensors[name][:4], source[1:5])
 
+    def test_async_reservations_flush_once_after_terminal_trim(self):
+        pool = HostBufferPool(
+            kv=make_kv_spec(),
+            max_tokens=6,
+            slots=1,
+            max_bytes=2 << 20,
+            registrar=Registrar(),
+            pin_memory=False,
+            device=torch.device("cpu"),
+            teacher_d2h_batch_tokens=6,
+            max_device_bytes=1 << 20,
+        )
+        slot = pool.acquire()
+        for name in slot.teacher_device_tensors:
+            slot.tensors[name].fill_(-5)
+        batcher = object()
+        context = RequestCaptureContext(
+            slot=slot,
+            prompt_ids=(3, 4),
+            max_tokens=6,
+            vocab_size=256,
+            teacher_batcher=batcher,
+        )
+        try:
+            context.kv_end = 5
+            for offset, position in enumerate((2, 3, 4), start=1):
+                row = context.reserve_async_teacher(position=position)
+                context.write_async_teacher(self.rows, row=offset, start=row)
+            context.commit_token(position=2, token_id=7)
+            context.commit_token(position=3, token_id=8)
+            context.trim_terminal_prefix()
+            context.seal("length")
+            for _ in range(3):
+                context.finish_async_teacher(None)
+            for name in slot.teacher_device_tensors:
+                self.assertTrue((slot.tensors[name] == -5).all())
+            context.wait_for_copies()
+            for name, source in self.expected.items():
+                torch.testing.assert_close(slot.tensors[name][:2], source[1:3])
+                self.assertTrue((slot.tensors[name][2:] == -5).all())
+        finally:
+            pool.release(slot, transfer_complete=True)
+            pool.close()
+
     def test_abort_discards_pending_rows_before_slot_reuse(self):
         context = RequestCaptureContext(
             slot=self.slot, prompt_ids=(3, 4), max_tokens=12, vocab_size=256

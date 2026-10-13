@@ -1,19 +1,180 @@
 """Raw teacher values and full-vocabulary normalization on CUDA."""
 
 import math
+import threading
 import unittest
+from unittest.mock import patch
 
 import torch
+from sglang.srt.training_capture.context import RequestCaptureContext
+from sglang.srt.training_capture.host_pool import HostBufferPool
 from sglang.srt.training_capture.protocol import ContractError
 from sglang.srt.training_capture.teacher import capture_teacher, warmup_teacher_capture
+from sglang.srt.training_capture.teacher_batcher import (
+    TeacherLogitBatcher,
+    TeacherRingFull,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.training_capture_utils import Registrar, make_kv_spec
 
 register_cuda_ci(est_time=180, stage="base-b", runner_config="1-gpu-small")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
 class TestTeacherCuda(CustomTestCase):
+    def test_async_ring_quarantines_failed_completion(self):
+        done = threading.Event()
+
+        class Destination:
+            transfer_uncertain = False
+            error = None
+
+            def validate_async_teacher(self, *, position):
+                pass
+
+            def reserve_async_teacher(self, *, position):
+                return 0
+
+            def finish_async_teacher(self, error):
+                self.error = error
+                done.set()
+
+        target = Destination()
+        batcher = TeacherLogitBatcher(
+            vocab_size=513,
+            ring_rows=2,
+            batch_rows=2,
+            device=torch.device("cuda"),
+            topk_backend="torch",
+        )
+        try:
+            with (
+                patch.object(batcher, "_compact", side_effect=RuntimeError("kernel")),
+                patch("torch.cuda.synchronize", side_effect=RuntimeError("fence")),
+            ):
+                batcher.enqueue(torch.randn(1, 513, device="cuda"), [0], [(target, 1)])
+                self.assertTrue(done.wait(timeout=5))
+                batcher.thread.join(timeout=5)
+            self.assertFalse(batcher.thread.is_alive())
+            self.assertTrue(target.transfer_uncertain)
+            self.assertEqual(str(target.error), "fence")
+            self.assertEqual(batcher.stats()["occupied_rows"], 1)
+            with self.assertRaisesRegex(Exception, "closed"):
+                batcher.enqueue(torch.randn(1, 513, device="cuda"), [0], [(target, 1)])
+            with self.assertRaisesRegex(Exception, "did not drain"):
+                batcher.close()
+        finally:
+            batcher.stop.set()
+            batcher.thread.join(timeout=5)
+            torch.cuda.synchronize()
+
+    def test_async_ring_owns_raw_rows_and_flushes_at_request_end(self):
+        vocab = 513
+        pool = HostBufferPool(
+            kv=make_kv_spec(),
+            max_tokens=4,
+            slots=2,
+            max_bytes=4 << 20,
+            registrar=Registrar(),
+            device=torch.device("cuda"),
+            teacher_d2h_batch_tokens=4,
+            max_device_bytes=4 << 20,
+        )
+        batcher = TeacherLogitBatcher(
+            vocab_size=vocab,
+            ring_rows=2,
+            batch_rows=2,
+            device=torch.device("cuda"),
+            topk_backend="torch",
+        )
+        slots = [pool.acquire(), pool.acquire()]
+        for slot in slots:
+            for name in (
+                "teacher_topk_ids",
+                "teacher_topk_logits",
+                "teacher_logsumexp",
+            ):
+                slot.tensors[name].fill_(-1)
+        contexts = [
+            RequestCaptureContext(
+                slot=slot,
+                prompt_ids=(3,),
+                max_tokens=4,
+                vocab_size=vocab,
+                teacher_batcher=batcher,
+            )
+            for slot in slots
+        ]
+        try:
+            raw = torch.randn(3, vocab + 7, device="cuda")
+            expected = capture_teacher(raw, vocab, [2, 0])
+            contexts[0].kv_end = 2
+            contexts[1].kv_end = 1
+            delayed = torch.cuda.Stream()
+            delayed.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(delayed):
+                torch.cuda._sleep(200_000_000)
+                batcher.enqueue(
+                    raw,
+                    [2, 0],
+                    [(contexts[0], 1), (contexts[1], 1)],
+                )
+                raw.fill_(float("nan"))
+            with self.assertRaises(TeacherRingFull):
+                batcher.enqueue(raw, [1], [(contexts[0], 2)])
+            for index, context in enumerate(contexts):
+                context.commit_token(position=1, token_id=index + 7)
+                context.seal("length")
+                self.assertEqual(context.slot.tensors["teacher_topk_ids"][0, 0], -1)
+                context.wait_for_copies()
+                torch.testing.assert_close(
+                    context.slot.tensors["teacher_topk_ids"][0],
+                    expected.token_ids[index].cpu(),
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    context.slot.tensors["teacher_topk_logits"][0],
+                    expected.logits[index].cpu(),
+                    rtol=0,
+                    atol=0,
+                )
+                torch.testing.assert_close(
+                    context.slot.tensors["teacher_logsumexp"][0],
+                    expected.logsumexp[index].cpu(),
+                    rtol=0,
+                    atol=0,
+                )
+
+            class RejectReservation:
+                def validate_async_teacher(self, *, position):
+                    pass
+
+                def reserve_async_teacher(self, *, position):
+                    raise ContractError("injected reservation failure")
+
+            failed_stream = torch.cuda.Stream()
+            failed_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(failed_stream):
+                torch.cuda._sleep(200_000_000)
+                with self.assertRaisesRegex(ContractError, "injected"):
+                    batcher.enqueue(
+                        torch.randn(1, vocab, device="cuda"),
+                        [0],
+                        [(RejectReservation(), 1)],
+                    )
+            batcher.work.join()
+            self.assertTrue(failed_stream.query())
+            self.assertEqual(batcher.stats()["occupied_rows"], 0)
+            self.assertEqual(batcher.stats()["processed_rows"], 2)
+            self.assertEqual(batcher.stats()["backpressure_rows"], 1)
+        finally:
+            batcher.close()
+            for slot in slots:
+                pool.release(slot, transfer_complete=True)
+            pool.close()
+
     def check_flashinfer(self, raw, vocab, indices=None):
         scores = raw[:, :vocab]
         if indices is not None:

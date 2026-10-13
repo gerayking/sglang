@@ -63,6 +63,84 @@ class TestCaptureConfiguration(CustomTestCase):
         self.args.disable_overlap_schedule = False
         validate_capture_server_args(self.args)
 
+    def test_hicache_l2_requires_write_through_and_one_token_pages(self):
+        self.config["kv_source"] = "hicache_l2"
+        self.path.write_text(json.dumps(self.config))
+
+        with self.assertRaisesRegex(ValueError, "hierarchical-cache"):
+            validate_capture_server_args(self.args)
+        self.args.enable_hierarchical_cache = True
+        self.args.hicache_write_policy = "write_back"
+        with self.assertRaisesRegex(ValueError, "write_through"):
+            validate_capture_server_args(self.args)
+        self.args.hicache_write_policy = "write_through"
+        self.args.page_size = 64
+        with self.assertRaisesRegex(ValueError, "page-size 1"):
+            validate_capture_server_args(self.args)
+        self.args.page_size = 1
+        validate_capture_server_args(self.args)
+
+    def test_hicache_l2_rejects_device_export_controls(self):
+        self.config.update(kv_source="hicache_l2", kv_export_backend="hicache")
+        self.path.write_text(json.dumps(self.config))
+        with self.assertRaisesRegex(ContractError, "does not use the device"):
+            CaptureConfig.load(str(self.path))
+
+    def test_process_writer_rejects_unimplemented_topologies(self):
+        self.config["snapshot_writer_backend"] = "process"
+        self.path.write_text(json.dumps(self.config))
+        validate_capture_server_args(self.args)
+        for name, value in (
+            ("tp_size", 2),
+            ("pp_size", 2),
+            ("disaggregation_mode", "decode"),
+            ("speculative_algorithm", "DSPARK"),
+        ):
+            previous = getattr(self.args, name)
+            try:
+                setattr(self.args, name, value)
+                with self.assertRaisesRegex(ValueError, "process snapshot writer"):
+                    validate_capture_server_args(self.args)
+            finally:
+                setattr(self.args, name, previous)
+
+    def test_async_teacher_requires_bounded_device_resources(self):
+        self.config["teacher_capture_backend"] = "async_ring"
+        for override, pattern in (
+            ({}, "device budget"),
+            (
+                {
+                    "max_device_bytes": 1 << 20,
+                    "teacher_gpu_ring_rows": 4,
+                    "teacher_background_batch_rows": 5,
+                },
+                "batch exceeds",
+            ),
+        ):
+            with self.subTest(override=override):
+                self.path.write_text(json.dumps(self.config | override))
+                with self.assertRaisesRegex(ContractError, pattern):
+                    CaptureConfig.load(str(self.path))
+        self.config.update(
+            max_device_bytes=1 << 20,
+            teacher_gpu_ring_rows=4,
+            teacher_background_batch_rows=2,
+        )
+        self.path.write_text(json.dumps(self.config))
+        validate_capture_server_args(self.args)
+        for name, value in (
+            ("speculative_algorithm", "DSPARK"),
+            ("disaggregation_mode", "decode"),
+        ):
+            with self.subTest(name=name):
+                previous = getattr(self.args, name)
+                setattr(self.args, name, value)
+                try:
+                    with self.assertRaisesRegex(ValueError, "async teacher"):
+                        validate_capture_server_args(self.args)
+                finally:
+                    setattr(self.args, name, previous)
+
     def test_unsupported_modes_fail_before_loading_weights(self):
         cases = {
             "dp_size": 2,

@@ -48,6 +48,8 @@ class CaptureTestRequest(SimpleNamespace):
             training_capture_context=None,
             training_capture_pd=None,
             training_capture_finalize=None,
+            training_capture_prepare_l2=None,
+            training_capture_finalize_after_cache=None,
             training_capture_latency=None,
             time_stats=SimpleNamespace(scheduler_recv_time=0.0),
         )
@@ -282,7 +284,7 @@ class OverlapCaptureFixture:
             buffer.copy_(torch.arange(buffer.numel()).view_as(buffer) + index * 256)
         self.sources = {k: v.clone() for k, v in coordinator.exporter.buffers.items()}
 
-    def forward(self, end):
+    def forward(self, end, *, positions_are_canonical=False, positions=None):
         from sglang.srt.model_executor.forward_batch_info import ForwardMode
 
         extend = end == 2
@@ -294,7 +296,12 @@ class OverlapCaptureFixture:
             ),
             SimpleNamespace(
                 extend_seq_lens_cpu=[2],
-                positions=torch.arange(0 if extend else end - 1, end),
+                positions=(
+                    torch.arange(0 if extend else end - 1, end)
+                    if positions is None
+                    else positions
+                ),
+                positions_are_canonical=positions_are_canonical,
             ),
             SimpleNamespace(next_token_logits=torch.arange(256).float()[None] + end),
             can_run_cuda_graph=False,

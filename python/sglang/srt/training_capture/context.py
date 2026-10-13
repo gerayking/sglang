@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from contextlib import nullcontext
 
 import torch
@@ -40,6 +41,7 @@ class RequestCaptureContext:
         max_tokens: int,
         vocab_size: int,
         partition: CapturePartition | None = None,
+        teacher_batcher=None,
     ):
         if not prompt_ids or len(prompt_ids) >= max_tokens:
             raise ContractError(
@@ -80,7 +82,12 @@ class RequestCaptureContext:
         self.max_tokens = max_tokens
         self.vocab_size = vocab_size
         self.kv_end = 0
+        self.kv_source_stream = None
         self.teacher_rows = 0
+        self.teacher_batcher = teacher_batcher
+        self.async_teacher_pending = 0
+        self.async_teacher_error = None
+        self.async_teacher_condition = threading.Condition()
         self.last_event = None
         self.last_stream = None
         self.kv_staging = (
@@ -93,7 +100,18 @@ class RequestCaptureContext:
             if slot is not None and slot.teacher_device_tensors is not None
             else None
         )
+        if teacher_batcher is not None and (
+            not self.owns_aux
+            or self.teacher_staging is None
+            or self.teacher_staging.capacity < max_tokens
+        ):
+            raise ContractError(
+                "async teacher capture requires full request-owned device staging"
+            )
         self.transfer_uncertain = False
+        self.l2_exporter = None
+        self.l2_lease = None
+        self.l2_materialized = False
         self.state = "COLLECTING"
         self.failure_reason = None
         self.sequence = None
@@ -159,6 +177,28 @@ class RequestCaptureContext:
             )
         self.kv_end = end
 
+    def defer_kv_progress(self, *, end: int, device=None):
+        """Record coverage whose KV bytes will be materialized from HiCache L2."""
+        self._collecting()
+        if not self.owns_kv or not self.kv_end <= end <= self.max_tokens:
+            raise ContractError("invalid deferred L2 KV coverage")
+        if device is not None and torch.device(device).type == "cuda":
+            self.kv_source_stream = torch.cuda.current_stream(device)
+        self.kv_end = end
+
+    def bind_l2_snapshot(self, exporter, lease):
+        """Attach a protected, completed-prefix L2 source before sealing."""
+        self._collecting()
+        if (
+            not self.owns_kv
+            or self.l2_lease is not None
+            or lease.host_indices.numel() != self.kv_end
+        ):
+            lease.release()
+            raise ContractError("L2 snapshot lease differs from KV coverage")
+        self.l2_exporter = exporter
+        self.l2_lease = lease
+
     def record_positions(self, positions: torch.Tensor, *, start: int):
         self._collecting()
         if not self.owns_aux:
@@ -188,14 +228,7 @@ class RequestCaptureContext:
         self._collecting()
         if not self.owns_aux:
             raise ContractError("only the aux owner records teacher payloads")
-        if (
-            count < 1
-            or position != self.prompt_length + self.teacher_rows
-            or position + count > self.max_tokens
-            or position + count - 1 > self.kv_end
-            or row < 0
-            or row + count > rows.logits.shape[0]
-        ):
+        if row < 0 or row + count > rows.logits.shape[0]:
             raise ContractError(
                 "teacher range is missing, duplicated, or shifted: "
                 f"count={count} position={position} "
@@ -203,6 +236,7 @@ class RequestCaptureContext:
                 f"max_tokens={self.max_tokens} kv_end={self.kv_end} "
                 f"row={row} available_rows={rows.logits.shape[0]}"
             )
+        self._validate_teacher_range(position=position, count=count)
         index = self.teacher_rows
         try:
             if self.teacher_staging is not None:
@@ -230,6 +264,58 @@ class RequestCaptureContext:
                 else rows.logits.device
             )
         self.teacher_rows += count
+
+    def _validate_teacher_range(self, *, position: int, count: int):
+        if (
+            count < 1
+            or position != self.prompt_length + self.teacher_rows
+            or position + count > self.max_tokens
+            or position + count - 1 > self.kv_end
+        ):
+            raise ContractError(
+                "teacher range is missing, duplicated, or shifted: "
+                f"count={count} position={position} "
+                f"expected_position={self.prompt_length + self.teacher_rows} "
+                f"max_tokens={self.max_tokens} kv_end={self.kv_end}"
+            )
+
+    def validate_async_teacher(self, *, position: int):
+        self._collecting()
+        if self.teacher_batcher is None or not self.owns_aux:
+            raise ContractError("request does not use async teacher capture")
+        self._validate_teacher_range(position=position, count=1)
+
+    def reserve_async_teacher(self, *, position: int):
+        self.validate_async_teacher(position=position)
+        index = self.teacher_rows
+        self.teacher_staging.reserve(start=index, count=1)
+        self.teacher_rows += 1
+        with self.async_teacher_condition:
+            self.async_teacher_pending += 1
+        return index
+
+    def write_async_teacher(self, rows: TeacherRows, *, row: int, start: int):
+        self.teacher_staging.write_reserved(rows, row=row, start=start)
+
+    def finish_async_teacher(self, error: BaseException | None):
+        with self.async_teacher_condition:
+            if error is not None and self.async_teacher_error is None:
+                self.async_teacher_error = error
+            if self.async_teacher_pending < 1:
+                raise ContractError("async teacher completion has no reservation")
+            self.async_teacher_pending -= 1
+            self.async_teacher_condition.notify_all()
+
+    def _wait_for_async_teacher(self):
+        if self.teacher_batcher is None:
+            return
+        with self.async_teacher_condition:
+            while self.async_teacher_pending:
+                self.async_teacher_condition.wait()
+            if self.async_teacher_error is not None:
+                raise ContractError(
+                    "async teacher compaction failed"
+                ) from self.async_teacher_error
 
     def trim_terminal_prefix(self):
         """Discard lookahead/verify suffixes past the scheduler's output boundary."""
@@ -298,7 +384,8 @@ class RequestCaptureContext:
         ):
             raise ContractError("cannot seal an incomplete response or KV prefix")
         self._flush_kv()
-        self._flush_staging(self.teacher_staging)
+        if self.teacher_batcher is None:
+            self._flush_staging(self.teacher_staging)
         if self.owns_aux:
             # The teacher ledger already checked every position. Materialize
             # only the committed prefix after speculative/lookahead trimming.
@@ -341,13 +428,29 @@ class RequestCaptureContext:
         if self.state in ("COLLECTING", "SEALED"):
             self.state = "FAILED"
             self.failure_reason = reason
+        if self.l2_lease is not None:
+            self.l2_lease.release()
+            self.l2_lease = None
 
     def wait_for_copies(self):
+        self._wait_for_async_teacher()
+        if self.teacher_batcher is not None and self.state == "SEALED":
+            if self.teacher_staging.end != self.teacher_rows:
+                self.teacher_staging.truncate(self.teacher_rows)
+            self._flush_staging(self.teacher_staging)
         if self.transfer_uncertain:
             raise ContractError("CUDA copy completion is uncertain")
         if self.last_event is not None:
             try:
                 self.last_event.synchronize()
+            except Exception:
+                self.transfer_uncertain = True
+                raise
+        if self.l2_lease is not None:
+            lease, self.l2_lease = self.l2_lease, None
+            try:
+                self.l2_exporter.materialize(lease, self.slot.tensors, end=self.kv_end)
+                self.l2_materialized = True
             except Exception:
                 self.transfer_uncertain = True
                 raise

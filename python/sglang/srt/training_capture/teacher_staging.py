@@ -76,6 +76,53 @@ class TeacherStaging:
             elif self.end - self.start == self.capacity:
                 self.flush()
 
+    def reserve(self, *, start: int, count: int):
+        """Reserve final row offsets before a background stream fills them."""
+        if (
+            start != self.end
+            or count < 1
+            or self.start != 0
+            or start + count > self.capacity
+        ):
+            raise ContractError("async teacher staging must cover the full sample")
+        self.end += count
+
+    def write_reserved(
+        self, rows: TeacherRows, *, row: int, start: int, count: int = 1
+    ):
+        if (
+            count < 1
+            or not 0 <= start < start + count <= self.end
+            or row < 0
+            or row + count > rows.logits.shape[0]
+        ):
+            raise ContractError("async teacher result is outside its reservation")
+        sources = {
+            "teacher_topk_ids": rows.token_ids,
+            "teacher_topk_logits": rows.logits,
+            "teacher_logsumexp": rows.logsumexp,
+        }
+        stream = (
+            torch.cuda.current_stream(self.device)
+            if self.device.type == "cuda"
+            else None
+        )
+        for name, source in sources.items():
+            target = self.device_tensors[name]
+            if (
+                source.device != self.device
+                or source.dtype != target.dtype
+                or source.shape[1:] != target.shape[1:]
+            ):
+                raise ContractError("async teacher result differs from its staging")
+            target[start : start + count].copy_(source[row : row + count])
+        self.stream = stream
+
+    def truncate(self, end: int):
+        if not self.start <= end <= self.end:
+            raise ContractError("teacher staging truncation is outside its rows")
+        self.end = end
+
     def flush(self):
         """Caller selects the producer stream and fences partial failures."""
         count = self.end - self.start

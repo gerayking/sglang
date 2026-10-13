@@ -101,7 +101,7 @@ class TestPDCapture(CustomTestCase):
             self.assertLess(time.monotonic(), deadline, self.decode.stats())
             time.sleep(0.01)
 
-    def begin(self, max_new_tokens=1):
+    def begin(self, *, max_new_tokens=1):
         self.wait_until(lambda: len(self.decode.available) == 1)
         req = CaptureTestRequest("decode", max_new_tokens)
         req.bootstrap_room, req.req_pool_idx = 19, 0
@@ -109,8 +109,8 @@ class TestPDCapture(CustomTestCase):
         self.assertIsNotNone(payload)
         return req, payload
 
-    def prefill_request(self, payload, **overrides):
-        req = CaptureTestRequest("prefill", 1)
+    def prefill_request(self, payload, *, max_new_tokens=1, **overrides):
+        req = CaptureTestRequest("prefill", max_new_tokens)
         req.bootstrap_room = 19
         req.bootstrap_host = "127.0.0.1"
         req.disagg_kv_sender = SimpleNamespace(
@@ -121,8 +121,8 @@ class TestPDCapture(CustomTestCase):
         self.prefill.before_forward([req])
         return req
 
-    def handoff(self, payload):
-        req = self.prefill_request(payload)
+    def handoff(self, payload, *, max_new_tokens=1):
+        req = self.prefill_request(payload, max_new_tokens=max_new_tokens)
         self.assertIsNotNone(req.training_capture_pd)
         logits = torch.randn(1, 256, generator=torch.Generator().manual_seed(917))
         raw = logits.clone()
@@ -323,8 +323,8 @@ class TestPDCapture(CustomTestCase):
         ):
             with self.subTest(output_length=output_length):
                 self.decode.capture_mode = "pd_speculative_accepted_target_path"
-                req, wire = self.begin(max_new_tokens=3)
-                payload, prefill_raw = self.handoff(wire)
+                req, wire = self.begin(max_new_tokens=output_length)
+                payload, prefill_raw = self.handoff(wire, max_new_tokens=output_length)
                 req.output_ids, req.eos_token_ids = [10], {20}
                 self.decode.accept_pd_handoff(req, payload)
                 logits = torch.randn(

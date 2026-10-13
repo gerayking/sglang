@@ -526,6 +526,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
     # Position information
     positions: torch.Tensor = None
+    # Set only by the ordinary sequence-position constructors below.
+    positions_are_canonical: bool = False
 
     # For extend
     extend_num_tokens: Optional[int] = None
@@ -905,6 +907,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if ret.forward_mode.is_decode() or ret.forward_mode.is_target_verify():
             if ret.positions is None:
                 ret.positions = clamp_position(batch.seq_lens)
+                ret.positions_are_canonical = True
         else:
             if isinstance(extend_seq_lens, list):
                 # Main path: H2D from host lists; populate *_cpu mirrors.
@@ -931,6 +934,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
             if ret.positions is None:
                 ret.positions = positions
+                ret.positions_are_canonical = True
             ret.extend_logprob_start_lens_cpu = extend_logprob_start_lens
 
         if model_runner.ngram_embedding_manager.enabled:

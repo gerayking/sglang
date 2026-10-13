@@ -3,7 +3,6 @@
 from datetime import timedelta
 
 import torch.distributed as dist
-
 from sglang.srt.training_capture.cohort import CaptureCohortAllocator
 from sglang.srt.training_capture.cohort_coordinator import CohortCaptureCoordinator
 from sglang.srt.training_capture.metrics import CaptureMetrics
@@ -20,6 +19,7 @@ def prepare_cohort_capture(
     layout,
     pool,
     req_to_token,
+    tree_cache=None,
     enable_overlap,
     capture_mode,
     metrics_labels,
@@ -53,10 +53,22 @@ def prepare_cohort_capture(
 
             coordinator_type = CohortDecodeCaptureCoordinator
         partition = layout.partitions[dist.get_rank(control)]
-        resources = CaptureResources.prepare(
-            config=config, kv=kv, partition=partition, source_pool=pool
-        )
-        if resources.exporter is not None and resources.exporter.device.type != "cuda":
+        resource_args = {
+            "config": config,
+            "kv": kv,
+            "partition": partition,
+            "source_pool": pool,
+        }
+        if config.teacher_capture_backend == "async_ring":
+            resource_args["teacher"] = teacher
+        if tree_cache is not None:
+            resource_args["tree_cache"] = tree_cache
+        resources = CaptureResources.prepare(**resource_args)
+        if (
+            config.kv_source == "device"
+            and resources.exporter is not None
+            and resources.exporter.device.type != "cuda"
+        ):
             raise ContractError("serving capture currently requires CUDA")
         metrics = CaptureMetrics(metrics_labels) if metrics_labels is not None else None
         return coordinator_type(

@@ -693,6 +693,52 @@ class HiCacheController:
         self.start_writing()
         return host_indices
 
+    def write_transient(
+        self, device_indices: torch.Tensor
+    ) -> Optional[tuple[torch.Tensor, device_module.Event]]:
+        """Copy KV into caller-owned L2 pages without publishing a radix node."""
+        host_indices = self.mem_pool_host.alloc(len(device_indices))
+        if host_indices is None:
+            return None
+
+        try:
+            is_pool_group = hasattr(self.mem_pool_host, "anchor_entry")
+            if is_pool_group:
+                transfer_host_indices = host_indices
+                transfer_device_indices = device_indices
+            elif (
+                self.io_backend == "kernel"
+                and self.mem_pool_host.layout == "page_first"
+                and getattr(self.mem_pool_host, "can_use_write_back_jit", False)
+            ):
+                transfer_host_indices = host_indices
+                transfer_device_indices = device_indices
+            else:
+                transfer_host_indices, transfer_device_indices = self.move_indices(
+                    host_indices, device_indices
+                )
+
+            source_ready = device_module.Event()
+            finish_event = device_module.Event()
+            source_ready.record()
+            with device_module.stream(self.write_stream):
+                source_ready.wait(self.write_stream)
+                self.mem_pool_host.backup_from_device_all_layer(
+                    self.mem_pool_device,
+                    transfer_host_indices,
+                    transfer_device_indices,
+                    self.io_backend,
+                )
+                finish_event.record()
+                if transfer_host_indices.is_cuda:
+                    transfer_host_indices.record_stream(self.write_stream)
+                if transfer_device_indices.is_cuda:
+                    transfer_device_indices.record_stream(self.write_stream)
+            return host_indices, finish_event
+        except Exception:
+            self.mem_pool_host.free(host_indices)
+            raise
+
     def start_writing(self) -> None:
         if len(self.write_queue) == 0:
             return

@@ -95,7 +95,22 @@ def _assert_pages_equal(host_ref, device_ref, host_pages, device_pages) -> None:
         )
 
 
-def _run_mha(element_dim: int, page_count: int) -> None:
+def _host_pages(page_count, pattern):
+    if pattern == "reverse":
+        return torch.arange(page_count, 0, -1, dtype=torch.int64)
+    pages = torch.arange(1, page_count + 1, dtype=torch.int64)
+    if pattern == "runs":
+        pages += torch.arange(page_count) // 8
+    return pages
+
+
+def _assert_untouched_pages(tensor, indices):
+    untouched = torch.ones(tensor.shape[0], dtype=torch.bool)
+    untouched[indices] = False
+    assert torch.isnan(tensor[untouched]).all()
+
+
+def _run_mha(element_dim: int, page_count: int, pattern="reverse") -> None:
     pool_size = PAGE_SIZE * (page_count + 8)
     device_pool = MHATokenToKVPool(
         size=pool_size,
@@ -119,9 +134,11 @@ def _run_mha(element_dim: int, page_count: int) -> None:
     for layer_id in range(NUM_LAYERS):
         _fill_with_offset(device_pool.k_buffer[layer_id], layer_id)
         _fill_with_offset(device_pool.v_buffer[layer_id], layer_id + 100)
+    host_pool.k_buffer.fill_(float("nan"))
+    host_pool.v_buffer.fill_(float("nan"))
 
     device_pages = torch.arange(2, 2 + page_count, device=DEVICE, dtype=torch.int64)
-    host_pages = torch.arange(page_count, 0, -1, dtype=torch.int64)
+    host_pages = _host_pages(page_count, pattern)
     device_indices = _token_indices_for_pages(device_pages)
     # host_indices stay on the CPU: this is the case the staged JIT kernel must
     # accept (kDLCPU / kDLGPUHost destination indices).
@@ -132,6 +149,8 @@ def _run_mha(element_dim: int, page_count: int) -> None:
         device_pool, host_indices, device_indices, "kernel"
     )
     torch.cuda.synchronize()
+    _assert_untouched_pages(host_pool.k_buffer, host_indices)
+    _assert_untouched_pages(host_pool.v_buffer, host_indices)
 
     for layer_id in range(NUM_LAYERS):
         _assert_pages_equal(
@@ -178,7 +197,7 @@ def _run_mha(element_dim: int, page_count: int) -> None:
         )
 
 
-def _run_mla(element_dim: int, page_count: int) -> None:
+def _run_mla(element_dim: int, page_count: int, pattern="reverse") -> None:
     pool_size = PAGE_SIZE * (page_count + 8)
     device_pool = MLATokenToKVPool(
         size=pool_size,
@@ -200,9 +219,10 @@ def _run_mla(element_dim: int, page_count: int) -> None:
 
     for layer_id in range(NUM_LAYERS):
         _fill_with_offset(device_pool.kv_buffer[layer_id], layer_id)
+    host_pool.kv_buffer.fill_(float("nan"))
 
     device_pages = torch.arange(2, 2 + page_count, device=DEVICE, dtype=torch.int64)
-    host_pages = torch.arange(page_count, 0, -1, dtype=torch.int64)
+    host_pages = _host_pages(page_count, pattern)
     device_indices = _token_indices_for_pages(device_pages)
     host_indices = _token_indices_for_pages(host_pages, device="cpu")
     assert not host_indices.is_cuda
@@ -211,6 +231,7 @@ def _run_mla(element_dim: int, page_count: int) -> None:
         device_pool, host_indices, device_indices, "kernel"
     )
     torch.cuda.synchronize()
+    _assert_untouched_pages(host_pool.kv_buffer, host_indices)
 
     for layer_id in range(NUM_LAYERS):
         _assert_pages_equal(
@@ -253,6 +274,16 @@ def test_page_first_staged_write_back_mha(element_dim: int, page_count: int) -> 
 @pytest.mark.parametrize("page_count", PAGE_COUNTS)
 def test_page_first_staged_write_back_mla(element_dim: int, page_count: int) -> None:
     _run_mla(element_dim, page_count)
+
+
+@pytest.mark.parametrize("pattern", ["contiguous", "runs"])
+def test_coalesced_mha_preserves_gaps_and_staging_boundaries(pattern):
+    _run_mha(128, 129, pattern)
+
+
+@pytest.mark.parametrize("pattern", ["contiguous", "runs"])
+def test_coalesced_mla_preserves_gaps_and_staging_boundaries(pattern):
+    _run_mla(576, 129, pattern)
 
 
 if __name__ == "__main__":
