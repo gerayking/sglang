@@ -10,6 +10,10 @@ from typing import TYPE_CHECKING
 import torch
 from sglang.srt.training_capture.protocol import CaptureError, ContractError
 from sglang.srt.training_capture.teacher import capture_teacher
+from sglang.srt.training_capture.teacher_staging import (
+    TeacherCompletion,
+    TeacherStaging,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.training_capture.context import RequestCaptureContext
@@ -21,7 +25,8 @@ class TeacherRingFull(CaptureError):
 
 @dataclass(frozen=True)
 class _Destination:
-    context: RequestCaptureContext
+    staging: TeacherStaging
+    completion: TeacherCompletion
     row: int
 
 
@@ -36,6 +41,13 @@ class _Job:
 
 class TeacherLogitBatcher:
     """Copy raw rows into a bounded ring, then compact them on another stream."""
+
+    def append(self, values, row_indices, targets):
+        return self.enqueue(values, row_indices, targets)
+
+    def seal(self, staging):
+        # The worker records the producer stream after finishing reserved rows.
+        pass
 
     def __init__(
         self,
@@ -156,10 +168,12 @@ class TeacherLogitBatcher:
         destinations = []
         try:
             for context, position in targets:
+                row = context.reserve_async_teacher(position=position)
                 destinations.append(
                     _Destination(
-                        context=context,
-                        row=context.reserve_async_teacher(position=position),
+                        staging=context.teacher_staging,
+                        completion=context.teacher_completion,
+                        row=row,
                     )
                 )
         except Exception as error:
@@ -222,7 +236,7 @@ class TeacherLogitBatcher:
                 )
                 for source_row in range(take):
                     destination = entries[offset + source_row]
-                    destination.context.write_async_teacher(
+                    destination.staging.write_reserved(
                         rows, row=source_row, start=destination.row
                     )
                 offset += take
@@ -237,8 +251,8 @@ class TeacherLogitBatcher:
         for job in jobs:
             for destination in job.destinations:
                 if not reusable:
-                    destination.context.transfer_uncertain = True
-                destination.context.finish_async_teacher(error)
+                    destination.staging.transfer_uncertain = True
+                destination.completion.finish(error)
             if reusable:
                 self._release(job.start, job.count)
             self.work.task_done()
@@ -310,4 +324,80 @@ class TeacherLogitBatcher:
             self.thread.join(timeout=20)
         if self.thread.is_alive() or self.used:
             raise CaptureError("teacher batcher did not drain")
+        self.closed = True
+
+
+class FinalHiddenCapture:
+    """Request-owned hidden rows, copied before model outputs can be overwritten."""
+
+    def __init__(self, *, device, spec):
+        self.device = torch.device(device)
+        if self.device.type == "cuda" and self.device.index is None:
+            self.device = torch.device("cuda", torch.cuda.current_device())
+        self.spec = spec
+        self.rows = 0
+        self.closed = False
+        self.copy_stream = (
+            torch.cuda.Stream(device=self.device)
+            if self.device.type == "cuda"
+            else None
+        )
+
+    def append(self, hidden, indices, targets):
+        if self.closed:
+            raise CaptureError("hidden capture is closed")
+        if (
+            hidden is None
+            or hidden.ndim != 2
+            or hidden.dtype != torch.bfloat16
+            or hidden.device != self.device
+            or hidden.shape[1] != self.spec.hidden_size
+            or not indices
+            or len(indices) != len(targets)
+            or any(
+                type(row) is not int or not 0 <= row < hidden.shape[0]
+                for row in indices
+            )
+        ):
+            raise ContractError("hidden output differs from the capture contract")
+        for context, position in targets:
+            context.validate_async_teacher(position=position)
+        stream = torch.cuda.current_stream(self.device) if hidden.is_cuda else None
+        for row, (context, _) in zip(indices, targets, strict=True):
+            staging = context.teacher_staging
+            if staging.stream is not None and staging.stream != stream:
+                stream.wait_stream(staging.stream)
+            offset = context.teacher_rows
+            staging.reserve(start=offset, count=1)
+            try:
+                staging.device_tensors["teacher_final_hidden"][offset].copy_(
+                    hidden[row]
+                )
+            except Exception:
+                context.transfer_uncertain = True
+                raise
+            staging.stream = stream
+            context.teacher_rows += 1
+            self.rows += 1
+        if stream is not None:
+            hidden.record_stream(stream)
+
+    def seal(self, staging):
+        if staging is None or not staging.end or self.copy_stream is None:
+            return
+        event = torch.cuda.Event()
+        event.record(staging.stream)
+        self.copy_stream.wait_event(event)
+        staging.stream = self.copy_stream
+
+    def stats(self):
+        return {
+            "hidden_rows": self.rows,
+            "processed_rows": self.rows,
+            "pending_rows": 0,
+        }
+
+    def close(self):
+        if not self.closed and self.copy_stream is not None:
+            self.copy_stream.synchronize()
         self.closed = True

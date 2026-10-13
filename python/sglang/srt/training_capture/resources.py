@@ -8,6 +8,7 @@ from typing import ClassVar
 import msgspec
 import torch
 from sglang.srt.training_capture.catalog import HTTPCaptureCatalog
+from sglang.srt.training_capture.codec import get_codec
 from sglang.srt.training_capture.host_pool import HostBufferPool
 from sglang.srt.training_capture.kv_exporter import (
     HiCacheL2KVExporter,
@@ -16,7 +17,10 @@ from sglang.srt.training_capture.kv_exporter import (
 from sglang.srt.training_capture.mooncake_store import MooncakeSnapshotStore
 from sglang.srt.training_capture.protocol import ContractError
 from sglang.srt.training_capture.snapshot_writer import PublicationJournal
-from sglang.srt.training_capture.teacher_batcher import TeacherLogitBatcher
+from sglang.srt.training_capture.teacher_batcher import (
+    FinalHiddenCapture,
+    TeacherLogitBatcher,
+)
 
 
 class CaptureResources:
@@ -144,9 +148,11 @@ class CaptureResources:
             self.device = torch.device(device)
             if self.device.type == "cuda" and self.device.index is None:
                 self.device = torch.device("cuda", torch.cuda.current_device())
-        async_teacher = config.teacher_capture_backend == "async_ring" and (
-            partition is None or partition.include_aux
-        )
+        codec = get_codec(config.contract_id)
+        async_teacher = config.teacher_capture_backend in (
+            "async_ring",
+            "final_hidden",
+        ) and (partition is None or partition.include_aux)
         self.pool = HostBufferPool(
             kv=kv,
             max_tokens=config.max_sample_tokens,
@@ -166,6 +172,7 @@ class CaptureResources:
             max_device_bytes=config.max_device_bytes,
             partition=partition,
             shared=config.snapshot_writer_backend == "process",
+            codec=codec,
         )
         if config.kv_export_backend == "hicache" and self.exporter is not None:
             for slot in self.pool.slots:
@@ -179,9 +186,13 @@ class CaptureResources:
                     "async teacher capture requires CUDA and pinned Host buffers"
                 )
             ring_bytes = (
-                config.teacher_gpu_ring_rows
-                * teacher.vocab_size
-                * torch.float32.itemsize
+                0
+                if codec.teacher.kind == "final_hidden"
+                else (
+                    config.teacher_gpu_ring_rows
+                    * teacher.vocab_size
+                    * torch.float32.itemsize
+                )
             )
             required = self.pool.device_allocated_bytes + ring_bytes
             if required > config.max_device_bytes:
@@ -189,19 +200,24 @@ class CaptureResources:
                     f"async teacher buffers require {required} bytes, "
                     f"budget is {config.max_device_bytes}"
                 )
-            self.teacher_batcher = TeacherLogitBatcher(
-                vocab_size=teacher.vocab_size,
-                ring_rows=config.teacher_gpu_ring_rows,
-                batch_rows=config.teacher_background_batch_rows,
-                device=self.device,
-                topk_backend=config.teacher_topk_backend,
-            )
+            if codec.teacher.kind == "final_hidden":
+                self.teacher_batcher = FinalHiddenCapture(
+                    device=self.device, spec=codec.teacher
+                )
+            else:
+                self.teacher_batcher = TeacherLogitBatcher(
+                    vocab_size=teacher.vocab_size,
+                    ring_rows=config.teacher_gpu_ring_rows,
+                    batch_rows=config.teacher_background_batch_rows,
+                    device=self.device,
+                    topk_backend=config.teacher_topk_backend,
+                )
         if config.snapshot_writer_backend == "process":
             from sglang.srt.training_capture.writer_process import ProcessSnapshotWriter
 
             self.writer_process = ProcessSnapshotWriter(config, self.pool)
         elif partition is None or partition.include_aux:
-            self.journal = PublicationJournal(config.journal_directory)
+            self.journal = PublicationJournal(config.journal_directory, codec=codec)
 
     def close(self):
         """Caller stops workers; both CUDA and Store must stop before release."""

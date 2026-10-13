@@ -205,7 +205,7 @@ class TimedClient:
         return value
 
 
-def probe_validate(manifest, tensors, *, payload_hasher):
+def probe_validate(manifest, tensors, *, payload_hasher, **kwargs):
     if getattr(LOCAL, "checksum_only", False):
         digests = payload_hasher.digests(
             [tensor_bytes(tensors[obj.key]) for obj in manifest.objects]
@@ -213,7 +213,7 @@ def probe_validate(manifest, tensors, *, payload_hasher):
         if digests != [obj.sha256 for obj in manifest.objects]:
             raise RuntimeError("probe checksum mismatch")
         return
-    return original_validate(manifest, tensors, payload_hasher=payload_hasher)
+    return original_validate(manifest, tensors, payload_hasher=payload_hasher, **kwargs)
 
 
 snapshot_writer.validate_tensors = probe_validate

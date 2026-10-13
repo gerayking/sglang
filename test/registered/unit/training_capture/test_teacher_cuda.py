@@ -3,6 +3,7 @@
 import math
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -14,6 +15,7 @@ from sglang.srt.training_capture.teacher_batcher import (
     TeacherLogitBatcher,
     TeacherRingFull,
 )
+from sglang.srt.training_capture.teacher_staging import TeacherCompletion
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.training_capture_utils import Registrar, make_kv_spec
@@ -26,19 +28,21 @@ class TestTeacherCuda(CustomTestCase):
     def test_async_ring_quarantines_failed_completion(self):
         done = threading.Event()
 
+        class Completion(TeacherCompletion):
+            def finish(self, error):
+                super().finish(error)
+                done.set()
+
         class Destination:
-            transfer_uncertain = False
-            error = None
+            teacher_staging = SimpleNamespace(transfer_uncertain=False)
+            teacher_completion = Completion()
 
             def validate_async_teacher(self, *, position):
                 pass
 
             def reserve_async_teacher(self, *, position):
+                self.teacher_completion.reserve()
                 return 0
-
-            def finish_async_teacher(self, error):
-                self.error = error
-                done.set()
 
         target = Destination()
         batcher = TeacherLogitBatcher(
@@ -57,8 +61,8 @@ class TestTeacherCuda(CustomTestCase):
                 self.assertTrue(done.wait(timeout=5))
                 batcher.thread.join(timeout=5)
             self.assertFalse(batcher.thread.is_alive())
-            self.assertTrue(target.transfer_uncertain)
-            self.assertEqual(str(target.error), "fence")
+            self.assertTrue(target.teacher_staging.transfer_uncertain)
+            self.assertEqual(str(target.teacher_completion.error), "fence")
             self.assertEqual(batcher.stats()["occupied_rows"], 1)
             with self.assertRaisesRegex(Exception, "closed"):
                 batcher.enqueue(torch.randn(1, 513, device="cuda"), [0], [(target, 1)])

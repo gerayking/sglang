@@ -9,13 +9,13 @@ from typing import Protocol
 
 import msgspec
 import torch
+from sglang.srt.training_capture.codec import TOP128_CODEC
 from sglang.srt.training_capture.protocol import (
     DTYPES,
     ELEMENT_BYTES,
     CaptureError,
     ContractError,
     KVSpec,
-    aux_specs,
 )
 from sglang.srt.training_capture.topology import CapturePartition
 
@@ -36,6 +36,8 @@ class HostSlot(msgspec.Struct, eq=False):
     teacher_device_tensors: dict[str, torch.Tensor] | None = None
     kv_export_tensors: dict[str, torch.Tensor] | None = None
     kv_exporter: object | None = None
+    epoch: int = 0
+    host_ready: bool = False
 
 
 class HostBufferPool:
@@ -62,6 +64,7 @@ class HostBufferPool:
         max_device_bytes: int = 0,
         partition: CapturePartition | None = None,
         shared: bool = False,
+        codec=TOP128_CODEC,
     ):
         if min(max_tokens, slots, max_bytes, manifest_bytes) <= 0:
             raise ValueError("Host pool sizes must be positive")
@@ -76,7 +79,8 @@ class HostBufferPool:
         include_aux = partition is None or partition.include_aux
         if partition is not None and not partition.active:
             raise ContractError("rank does not own a capture payload")
-        specs = aux_specs(max_tokens, max_tokens) if include_aux else {}
+        self.codec = codec
+        specs = codec.aux_specs(max_tokens, max_tokens) if include_aux else {}
         kv_names = []
         for layer in layers:
             for component, dim in (
@@ -107,11 +111,7 @@ class HostBufferPool:
         staging_groups = (
             (kv_names, kv_d2h_batch_tokens, "KV"),
             (
-                (
-                    ["teacher_topk_ids", "teacher_topk_logits", "teacher_logsumexp"]
-                    if include_aux
-                    else []
-                ),
+                (codec.teacher.tensor_names if include_aux else []),
                 teacher_d2h_batch_tokens,
                 "teacher",
             ),
@@ -258,6 +258,8 @@ class HostBufferPool:
             for slot in self.slots:
                 if slot.state == "free":
                     slot.state = "filling"
+                    slot.epoch += 1
+                    slot.host_ready = False
                     return slot
         return None
 

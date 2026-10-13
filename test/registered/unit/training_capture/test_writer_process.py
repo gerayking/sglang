@@ -23,7 +23,7 @@ from sglang.srt.training_capture.protocol import (
     ContractError,
     decode_manifest,
 )
-from sglang.srt.training_capture.snapshot import SnapshotMetadata
+from sglang.srt.training_capture.snapshot import HostReadyCapture, SnapshotMetadata
 from sglang.srt.training_capture.snapshot_writer import (
     PublicationJournal,
     SnapshotWriter,
@@ -161,6 +161,7 @@ class TestProcessWriter(unittest.TestCase):
                 target[start:end].copy_(value)
             else:
                 target[: len(value)].copy_(value)
+        self.slot.host_ready = True
         return writer
 
     def on_prepared(self, lease, data):
@@ -214,6 +215,27 @@ class TestProcessWriter(unittest.TestCase):
         writer.close()
         self.assertIsNotNone(writer.process.poll())
         PublicationJournal(self.directory.name).close()
+
+    def test_publish_rejects_unready_or_recycled_host_slot(self):
+        writer = self.start()
+        self.slot.host_ready = False
+        sample = HostReadyCapture(
+            slot_id=0,
+            slot_epoch=self.slot.epoch,
+            metadata=self.metadata,
+            valid_kv_tokens=self.manifest.sequence.total_length - 1,
+            lease=self.lease,
+        )
+        with self.assertRaisesRegex(ContractError, "not ready"):
+            writer.publish(sample)
+        with self.assertRaisesRegex(ContractError, "not ready"):
+            self.write(writer)
+        self.pool.release(self.slot, transfer_complete=True)
+        self.slot = self.pool.acquire()
+        self.slot.host_ready = True
+        with self.assertRaisesRegex(ContractError, "stale"):
+            writer.publish(sample)
+        self.assertNotIn("publication", self.state)
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_pinned_shared_pool_d2h_and_release(self):

@@ -287,11 +287,16 @@ def _coverage(objects: list[TensorDescriptor], n: int, heads: int) -> int:
     return end
 
 
-def validate_manifest(manifest: Manifest, *, max_tensor_bytes: int = 2 << 30) -> int:
+def validate_manifest(
+    manifest: Manifest, *, max_tensor_bytes: int = 2 << 30, _codec=None
+) -> int:
     """Validate before allocating or reading tensor objects; return KV coverage."""
     # Struct constructors are intentionally cheap; decoding checks annotated types.
     try:
-        msgspec.json.decode(msgspec.json.encode(manifest), type=Manifest)
+        msgspec.json.decode(
+            msgspec.json.encode(manifest),
+            type=Manifest if _codec is None else _codec.manifest_type,
+        )
     except (msgspec.ValidationError, TypeError, ValueError) as error:
         raise ContractError("invalid manifest field") from error
     if manifest.extensions.get("example_only"):
@@ -302,7 +307,7 @@ def validate_manifest(manifest: Manifest, *, max_tensor_bytes: int = 2 << 30) ->
             raise ValueError("missing timezone")
     except ValueError as error:
         raise ContractError("created_at must be an RFC3339 timestamp") from error
-    if manifest.logits.lse_temperature != 1.0:
+    if manifest.logits is not None and manifest.logits.lse_temperature != 1.0:
         raise ContractError("teacher LSE must use temperature 1")
     n, p, r = (
         manifest.sequence.total_length,
@@ -320,7 +325,7 @@ def validate_manifest(manifest: Manifest, *, max_tensor_bytes: int = 2 << 30) ->
     owners = manifest.topology.owners
     if len(set(owners)) != len(owners) or manifest.topology.aux_owner not in owners:
         raise ContractError("invalid owner set")
-    specs = aux_specs(n, r)
+    specs = aux_specs(n, r) if _codec is None else _codec.aux_specs(n, r)
     seen_ids, seen_keys, seen_aux = set(), set(), set()
     groups = defaultdict(list)
     geometries = {g.layer_id: g for g in manifest.kv.layers}
@@ -406,16 +411,21 @@ def validate_manifest(manifest: Manifest, *, max_tensor_bytes: int = 2 << 30) ->
 
 
 def decode_manifest(
-    data: bytes, *, max_manifest_bytes: int = 8 << 20, max_tensor_bytes: int = 2 << 30
+    data: bytes,
+    *,
+    max_manifest_bytes: int = 8 << 20,
+    max_tensor_bytes: int = 2 << 30,
+    _codec=None,
 ) -> Manifest:
     if len(data) > max_manifest_bytes:
         raise ContractError("manifest exceeds metadata budget")
     try:
-        manifest = msgspec.json.decode(data, type=Manifest)
+        manifest_type = Manifest if _codec is None else _codec.manifest_type
+        manifest = msgspec.json.decode(data, type=manifest_type)
         raw = msgspec.json.decode(data)
     except msgspec.DecodeError as error:
         raise ContractError("invalid manifest JSON") from error
-    required = set(Manifest.__struct_fields__) - {"extensions"}
+    required = set(manifest_type.__struct_fields__) - {"extensions"}
     if not required.issubset(raw):
         raise ContractError("missing required manifest fields")
     for name, cls in (
@@ -426,6 +436,8 @@ def decode_manifest(
         ("topology", Topology),
         ("provenance", Provenance),
     ):
+        if name == "logits" and manifest.logits is None:
+            continue
         if not set(cls.__struct_fields__).issubset(raw[name]):
             raise ContractError(f"missing required {name} fields")
     for obj in raw["objects"]:
@@ -434,7 +446,8 @@ def decode_manifest(
             required -= {"layer_id", "component", "token_range", "head_range"}
         if not required.issubset(obj):
             raise ContractError("missing required tensor descriptor fields")
-    validate_manifest(manifest, max_tensor_bytes=max_tensor_bytes)
+    validator = validate_manifest if _codec is None else _codec.validate_manifest
+    validator(manifest, max_tensor_bytes=max_tensor_bytes)
     return manifest
 
 
@@ -457,9 +470,11 @@ def validate_tensors(
     max_tensor_bytes: int = 2 << 30,
     owner_id: str | None = None,
     payload_hasher=None,
+    _codec=None,
 ) -> None:
     """Validate all payloads, or exactly one owner's payloads of a complete manifest."""
-    nv = validate_manifest(manifest, max_tensor_bytes=max_tensor_bytes)
+    validator = validate_manifest if _codec is None else _codec.validate_manifest
+    nv = validator(manifest, max_tensor_bytes=max_tensor_bytes)
     if owner_id is not None and owner_id not in manifest.topology.owners:
         raise ContractError("unregistered tensor partition owner")
     objects = [
@@ -512,6 +527,8 @@ def validate_tensors(
     expected_valid[:nv] = 1
     if not torch.equal(aux["kv_valid"], expected_valid):
         raise ContractError("KV validity differs from object coverage")
+    if manifest.logits is None:
+        return
     ids = aux["teacher_topk_ids"]
     if not ((ids >= 0) & (ids < vocab)).all():
         raise ContractError("top-k IDs outside teacher vocabulary")

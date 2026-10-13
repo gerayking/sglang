@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Annotated, Literal
 
 import msgspec
+from sglang.srt.training_capture.codec import get_codec
 from sglang.srt.training_capture.protocol import (
     ContractError,
     Digest,
@@ -102,7 +103,7 @@ class CaptureConfig(StrictStruct):
     kv_export_backend: Literal["torch", "hicache"] = "torch"
     teacher_d2h_batch_tokens: Positive = 1
     teacher_topk_backend: Literal["torch", "flashinfer"] = "torch"
-    teacher_capture_backend: Literal["inline", "async_ring"] = "inline"
+    teacher_capture_backend: Literal["inline", "async_ring", "final_hidden"] = "inline"
     teacher_gpu_ring_rows: Positive = 32
     teacher_background_batch_rows: Positive = 16
     payload_hash_workers: Annotated[int, msgspec.Meta(ge=1, le=8)] = 1
@@ -123,6 +124,19 @@ class CaptureConfig(StrictStruct):
         if source.stat().st_size > 1 << 20:
             raise ContractError("capture configuration is too large")
         config = msgspec.json.decode(source.read_bytes(), type=cls)
+        codec = get_codec(config.contract_id)
+        if (codec.teacher.kind == "final_hidden") != (
+            config.teacher_capture_backend == "final_hidden"
+        ):
+            raise ContractError("teacher backend and capture contract disagree")
+        if codec.teacher.kind == "final_hidden" and (
+            config.kv_source != "hicache_l2"
+            or config.snapshot_writer_backend != "process"
+            or not config.max_device_bytes
+        ):
+            raise ContractError(
+                "final hidden requires L2, a process writer and a device budget"
+            )
         if not config.selected_layer_ids or len(config.selected_layer_ids) != len(
             set(config.selected_layer_ids)
         ):
@@ -201,6 +215,15 @@ def validate_capture_server_args(args) -> None:
     from sglang.srt.environ import envs
 
     unsupported = {
+        "experimental final hidden outside single-rank AR": (
+            config.teacher_capture_backend == "final_hidden"
+            and (
+                args.tp_size != 1
+                or args.pp_size != 1
+                or args.disaggregation_mode != "null"
+                or args.speculative_algorithm is not None
+            )
+        ),
         "process snapshot writer with TP/PP, PD or speculative decoding": (
             config.snapshot_writer_backend == "process"
             and (

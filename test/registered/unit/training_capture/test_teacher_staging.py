@@ -1,6 +1,7 @@
 """Teacher batching preserves accepted rows through reuse and partial flushes."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -102,7 +103,7 @@ class TestTeacherStaging(CustomTestCase):
         slot = pool.acquire()
         for name in slot.teacher_device_tensors:
             slot.tensors[name].fill_(-5)
-        batcher = object()
+        batcher = SimpleNamespace(seal=lambda staging: None)
         context = RequestCaptureContext(
             slot=slot,
             prompt_ids=(3, 4),

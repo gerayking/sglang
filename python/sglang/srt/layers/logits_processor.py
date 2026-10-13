@@ -51,7 +51,7 @@ from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.runtime_context import get_exec, get_parallel
+from sglang.srt.runtime_context import get_exec, get_parallel, get_serving
 from sglang.srt.utils.common import (
     is_cpu,
     is_npu,
@@ -143,6 +143,8 @@ class LogitsProcessorOutput:
     # workaround since ForwardBatch is local to forward_batch_generation().
     # They should be moved to GenerationBatchResult to keep this class clean.
     mm_input_embeds: Optional[torch.Tensor] = None
+    # Post-final-norm rows for training capture; independent of API/spec hidden states.
+    training_capture_hidden_states: Optional[torch.Tensor] = None
 
 
 @dataclasses.dataclass
@@ -318,6 +320,23 @@ class LogitsProcessor(nn.Module):
         self.return_full_logits = return_full_logits
         self.enable_mis = get_exec().features.enable_mis
         self.rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
+        self.capture_final_hidden = False
+        capture_path = get_serving().training_capture_config
+        if capture_path is not None:
+            from sglang.srt.training_capture.codec import HIDDEN_SIZE
+            from sglang.srt.training_capture.config import CaptureConfig
+
+            capture = CaptureConfig.load(capture_path)
+            self.capture_final_hidden = (
+                capture.teacher_capture_backend == "final_hidden"
+            )
+            if self.capture_final_hidden and (
+                getattr(config, "model_type", None) != "qwen3_5_text"
+                or getattr(config, "hidden_size", None) != HIDDEN_SIZE
+            ):
+                raise ValueError(
+                    "experimental final-hidden capture supports Qwen3.5-4B only"
+                )
 
         self._logits_gatherer = triton_symm_mem_ag.MultimemAllGatherer(
             max_tokens=triton_symm_mem_ag.recommended_max_tokens(
@@ -389,6 +408,13 @@ class LogitsProcessor(nn.Module):
             sample_indices,
             logits_metadata,
         )
+        capture_hidden = None
+        if self.capture_final_hidden:
+            capture_hidden = (
+                pruned_states
+                if sample_indices is None
+                else pruned_states[sample_indices]
+            )
         del hidden_states
 
         if not logits_metadata.extend_return_logprob:
@@ -402,6 +428,7 @@ class LogitsProcessor(nn.Module):
             return LogitsProcessorOutput(
                 next_token_logits=sampled_logits,
                 hidden_states=hidden_states_to_store,
+                training_capture_hidden_states=capture_hidden,
                 mm_input_embeds=logits_metadata.mm_input_embeds,
             )
 
@@ -419,6 +446,7 @@ class LogitsProcessor(nn.Module):
         logits_output = LogitsProcessorOutput(
             next_token_logits=sampled_logits,
             hidden_states=hidden_states_to_store,
+            training_capture_hidden_states=capture_hidden,
             mm_input_embeds=logits_metadata.mm_input_embeds,
         )
         logprobs_result.write_input_to(logits_output)

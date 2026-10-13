@@ -20,6 +20,7 @@ from sglang.srt.training_capture.catalog import (
     manifest_descriptor,
     seal_payload,
 )
+from sglang.srt.training_capture.codec import TOP128_CODEC
 from sglang.srt.training_capture.mooncake_store import MooncakeSnapshotStore
 from sglang.srt.training_capture.protocol import (
     DTYPES,
@@ -32,7 +33,6 @@ from sglang.srt.training_capture.protocol import (
     canonical_bytes,
     decode_manifest,
     digest_bytes,
-    validate_manifest,
     validate_tensors,
 )
 from sglang.srt.training_capture.timings import CaptureTimings
@@ -50,7 +50,8 @@ class OwnerWriteReceipt(StrictStruct):
 class PublicationJournal:
     """One process owns a journal; tensor bytes never enter this directory."""
 
-    def __init__(self, directory: str):
+    def __init__(self, directory: str, *, codec=TOP128_CODEC):
+        self.codec = codec
         self.root = Path(directory)
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.lock = (self.root / "producer.lock").open("a")
@@ -114,7 +115,7 @@ class PublicationJournal:
             if path != self._path(lease.capture_id):
                 raise ContractError("journal filename and capture identity disagree")
             data = base64.b64decode(value["manifest_base64"], validate=True)
-            decode_manifest(data)
+            decode_manifest(data, _codec=self.codec)
             yield lease, data
 
     def has_pending(self, capture_id: str) -> bool:
@@ -143,10 +144,14 @@ class SnapshotWriter:
         journal: PublicationJournal,
         *,
         timings: CaptureTimings | None = None,
+        codec=TOP128_CODEC,
     ):
         self.store = store
         self.catalog = catalog
         self.journal = journal
+        self.codec = codec
+        if journal is not None and journal.codec != codec:
+            raise ContractError("writer and recovery journal codecs differ")
         self.timings = timings if timings is not None else CaptureTimings()
 
     @staticmethod
@@ -197,7 +202,10 @@ class SnapshotWriter:
         self._check_identity(manifest, lease)
         with self.timings.measure("validation"):
             validate_tensors(
-                manifest, tensors, payload_hasher=self.store.payload_hasher
+                manifest,
+                tensors,
+                payload_hasher=self.store.payload_hasher,
+                _codec=self.codec,
             )
             if check_current is not None:
                 check_current()
@@ -264,6 +272,7 @@ class SnapshotWriter:
             tensors,
             owner_id=owner_id,
             payload_hasher=self.store.payload_hasher,
+            _codec=self.codec,
         )
         data = canonical_bytes(manifest)
         descriptor = self._manifest_object(manifest, data)
@@ -318,7 +327,7 @@ class SnapshotWriter:
         The durable publication journal then uses the ordinary recovery path.
         """
         self._check_identity(manifest, lease)
-        self.timings.call("validation", validate_manifest, manifest)
+        self.timings.call("validation", self.codec.validate_manifest, manifest)
         data = canonical_bytes(manifest)
         if len(data) > manifest_buffer.numel() or manifest_buffer.dtype != torch.uint8:
             raise ContractError("manifest exceeds reserved Host buffer")
@@ -381,7 +390,7 @@ class SnapshotWriter:
         registered manifest buffer. Never reuse an uncertain source arena.
         """
         self._check_identity(manifest, lease)
-        validate_manifest(manifest)
+        self.codec.validate_manifest(manifest)
         data = canonical_bytes(manifest)
         self._check_receipts(manifest, receipts, lease, data)
         with self.timings.measure("recovery_read"):
@@ -444,7 +453,7 @@ class SnapshotWriter:
         The journal may be absent after a failed save or post-publish cleanup.
         Recreate it before replay, and never use the former payload/source arena.
         """
-        manifest = decode_manifest(data)
+        manifest = self.codec.decode_manifest(data)
         self._check_identity(manifest, lease)
         check_seal_capacity(manifest, self._manifest_object(manifest, data), lease)
         self.timings.call("journal_save", self.journal.save, lease, data)
@@ -467,7 +476,7 @@ class SnapshotWriter:
         """
         receipts = []
         for lease, data in self.journal.pending():
-            manifest = decode_manifest(data)
+            manifest = self.codec.decode_manifest(data)
             self._check_identity(manifest, lease)
             receipts.append(self._recover_publication(manifest, data, lease))
         return receipts

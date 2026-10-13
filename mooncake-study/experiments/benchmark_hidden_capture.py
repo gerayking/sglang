@@ -18,10 +18,8 @@ def main():
     cli, remainder = parser.parse_known_args()
     sys.argv = [sys.argv[0], *remainder]
     if cli.feature == "hidden":
-        from sglang.test import training_capture_hidden_codec as codec
-
-        codec.install()
         from sglang.test import training_capture_catalog
+        from sglang.test import training_capture_hidden_codec as codec
 
         training_capture_catalog.decode_manifest = codec.decode_manifest
         catalog_init = bench.TestCaptureCatalog.__init__
@@ -39,7 +37,10 @@ def main():
         config = bench.capture_config
 
         def hidden_config(*args):
-            return config(*args) | {"contract_id": codec.CONTRACT}
+            return config(*args) | {
+                "contract_id": codec.CONTRACT,
+                "teacher_capture_backend": "final_hidden",
+            }
 
         bench.capture_config = hidden_config
 

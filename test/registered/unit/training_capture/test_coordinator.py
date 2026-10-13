@@ -376,11 +376,13 @@ class TestCaptureCoordinator(CustomTestCase):
     def test_weight_update_preserves_already_detached_snapshot(self):
         req, record = self.sealed_request("sealed-before-update")
         entered, release = threading.Event(), threading.Event()
+        materialize = record.context.wait_for_copies
 
         def wait_for_copy():
             entered.set()
             if not release.wait(5):
                 raise TimeoutError("copy gate")
+            materialize()
 
         try:
             with patch.object(
@@ -419,6 +421,7 @@ class TestCaptureCoordinator(CustomTestCase):
         ):
             with self.subTest(field=field):
                 req, record = self.sealed_request("corrupt-" + field)
+                record.context.wait_for_copies()
                 tensor = record.slot.tensors[field]
                 if field == "loss_mask":
                     tensor[0] = 1

@@ -244,6 +244,7 @@ class TestCaptureContext(CustomTestCase):
         self.context.record_teacher(self.rows, row=0, position=2)
         self.context.commit_token(position=2, token_id=5)
         self.context.seal("length")
+        self.context.wait_for_copies()
         self.slot.tensors["loss_mask"][0] = 1
         manifest, tensors = self.snapshot(prepare=True)
         with self.assertRaisesRegex(ContractError, "mask"):
@@ -257,8 +258,8 @@ class TestCaptureContext(CustomTestCase):
         self.context.commit_token(position=2, token_id=5)
         self.context.seal("length")
 
-        def cancelled_validation(*args):
-            validate_tensors(*args)
+        def cancelled_validation(*args, **kwargs):
+            validate_tensors(*args, **kwargs)
             self.context.abort("peer_failed")
 
         with (

@@ -2,9 +2,40 @@
 
 from __future__ import annotations
 
+import threading
+
 import torch
 from sglang.srt.training_capture.protocol import ContractError
 from sglang.srt.training_capture.teacher import TeacherRows
+
+
+class TeacherCompletion:
+    """Transfer receipts shared with workers, independent of the token ledger."""
+
+    def __init__(self):
+        self.condition = threading.Condition()
+        self.pending = 0
+        self.error = None
+
+    def reserve(self):
+        with self.condition:
+            self.pending += 1
+
+    def finish(self, error=None):
+        with self.condition:
+            if self.pending < 1:
+                raise ContractError("async teacher completion has no reservation")
+            if error is not None and self.error is None:
+                self.error = error
+            self.pending -= 1
+            self.condition.notify_all()
+
+    def wait(self):
+        with self.condition:
+            while self.pending:
+                self.condition.wait()
+            if self.error is not None:
+                raise ContractError("async teacher compaction failed") from self.error
 
 
 class TeacherStaging:

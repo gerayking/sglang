@@ -353,6 +353,7 @@ class TestCaptureStartup(CustomTestCase):
             expected_weights_revision="weights",
             expected_tokenizer_revision="tokenizer",
             teacher_topk_backend="flashinfer",
+            contract_id="maas-target-kv-top128-v1",
         )
 
         def exchange(*, build_local, **kwargs):

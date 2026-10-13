@@ -19,12 +19,13 @@ from sglang.srt.training_capture.catalog import (
     CatalogUnavailable,
     HTTPCaptureCatalog,
 )
+from sglang.srt.training_capture.codec import get_codec
 from sglang.srt.training_capture.mooncake_store import (
     MooncakeSnapshotStore,
     TransportError,
 )
 from sglang.srt.training_capture.protocol import DTYPES, CaptureError, ContractError
-from sglang.srt.training_capture.snapshot import prepare_snapshot
+from sglang.srt.training_capture.snapshot import HostReadyCapture, prepare_snapshot
 from sglang.srt.training_capture.snapshot_writer import (
     PublicationJournal,
     SnapshotWriter,
@@ -58,6 +59,7 @@ class ProcessTimings(CaptureTimings):
 
 
 def _connect_writer(config):
+    codec = get_codec(config.contract_id)
     catalog = HTTPCaptureCatalog(
         config.catalog_endpoint,
         bearer_token=(
@@ -74,7 +76,10 @@ def _connect_writer(config):
     )
     try:
         return SnapshotWriter(
-            store, catalog, PublicationJournal(config.journal_directory)
+            store,
+            catalog,
+            PublicationJournal(config.journal_directory, codec=codec),
+            codec=codec,
         )
     except Exception:
         store.close()
@@ -89,6 +94,7 @@ def _writer_main(
     writer = None
     slots = []
     sequence = 0
+    slot_epochs = {}
 
     def reply(kind, value=None):
         connection.send(
@@ -130,7 +136,21 @@ def _writer_main(
             sequence, operation, payload = connection.recv()
             try:
                 if operation == "write":
-                    index, metadata, valid_tokens, lease = payload
+                    if not isinstance(payload, HostReadyCapture):
+                        raise ContractError("writer requires a Host-ready descriptor")
+                    index = payload.slot_id
+                    if (
+                        not 0 <= index < len(slots)
+                        or payload.slot_epoch < 1
+                        or payload.slot_epoch < slot_epochs.get(index, 0)
+                    ):
+                        raise ContractError("stale or invalid Host buffer reference")
+                    slot_epochs[index] = payload.slot_epoch
+                    metadata, valid_tokens, lease = (
+                        payload.metadata,
+                        payload.valid_kv_tokens,
+                        payload.lease,
+                    )
                     _, buffers, manifest_buffer = slots[index]
                     manifest, tensors = writer.timings.call(
                         "snapshot_build",
@@ -325,13 +345,34 @@ class ProcessSnapshotWriter:
         return self._call("begin", identity)
 
     def build_and_write(self, slot, metadata, valid_tokens, lease, **callbacks):
+        """Compatibility entry using the same Host readiness checks as publish."""
         index = self.indices[id(slot)]
+        sample = HostReadyCapture(
+            slot_id=index,
+            slot_epoch=slot.epoch,
+            metadata=metadata,
+            valid_kv_tokens=valid_tokens,
+            lease=lease,
+        )
+        return self.publish(sample, **callbacks)
+
+    def publish(self, sample: HostReadyCapture, **callbacks):
+        if not 0 <= sample.slot_id < len(self.pool.slots):
+            raise ContractError("invalid Host slot index")
+        slot = self.pool.slots[sample.slot_id]
+        if (
+            slot.epoch != sample.slot_epoch
+            or slot.state != "filling"
+            or not slot.host_ready
+        ):
+            raise ContractError("Host buffer is stale or not ready for publication")
+        return self._publish(sample, **callbacks)
+
+    def _publish(self, sample, **callbacks):
         try:
-            return self._call(
-                "write", (index, metadata, valid_tokens, lease), **callbacks
-            )
+            return self._call("write", sample, **callbacks)
         except TransportError:
-            self.quarantined.add(slot.storage.data_ptr())
+            self.quarantined.add(self.pool.slots[sample.slot_id].storage.data_ptr())
             raise
 
     def recover_prepared(self, lease, data):

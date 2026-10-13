@@ -9,6 +9,33 @@ through a Catalog service.
 Capture is disabled unless `--training-capture-config` is provided. The normal
 serving path does not initialize capture resources when the option is absent.
 
+The [interface contract](INTERFACES.md) defines refactor boundaries, execution
+domains, and buffer ownership. Explicit teacher codecs, hidden capture, transfer
+receipts and sealed/Host-ready descriptors are implemented; its controller and
+full resource-lease split remain proposed.
+
+## Experimental Final Hidden
+
+The normal launch entry point can explicitly select experimental final-hidden
+capture with these additional configuration values:
+
+```json
+{
+  "contract_id": "experimental-target-kv-final-hidden-v1",
+  "teacher_capture_backend": "final_hidden",
+  "kv_source": "hicache_l2",
+  "snapshot_writer_backend": "process",
+  "max_device_bytes": 134217728
+}
+```
+
+This mode currently supports Qwen3.5-4B BF16, single-rank autoregressive serving
+with write-through HiCache and one-token pages. It uses a dedicated post-norm
+model-output field, preserving API/speculative `hidden_states` semantics.
+It does not require the test hidden-server entry point or a codec installer.
+Its distinct wire contract remains experimental and compatible with the paired
+SpecForge hidden reader; the default top-128 contract is unchanged.
+
 ## Configuration
 
 Pass a JSON file when starting the server:

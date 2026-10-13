@@ -1364,6 +1364,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     else None
                 ),
                 customized_info=output.customized_info,
+                training_capture_hidden_states=(
+                    output.training_capture_hidden_states[: self.raw_num_token]
+                    if output.training_capture_hidden_states is not None
+                    else None
+                ),
             )
         else:
             assert isinstance(output, PPProxyTensors)

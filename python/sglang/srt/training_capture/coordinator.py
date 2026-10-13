@@ -18,6 +18,7 @@ import torch
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.training_capture.admission import CaptureAdmission
 from sglang.srt.training_capture.catalog import CaptureLease, CatalogConflict
+from sglang.srt.training_capture.codec import get_codec
 from sglang.srt.training_capture.cohort_service import CaptureHandle
 from sglang.srt.training_capture.config import CaptureConfig
 from sglang.srt.training_capture.context import RequestCaptureContext
@@ -34,7 +35,11 @@ from sglang.srt.training_capture.protocol import (
     SequenceInfo,
 )
 from sglang.srt.training_capture.resources import CaptureResources
-from sglang.srt.training_capture.snapshot import SnapshotMetadata, manifest_fits_budget
+from sglang.srt.training_capture.snapshot import (
+    HostReadyCapture,
+    SnapshotMetadata,
+    manifest_fits_budget,
+)
 from sglang.srt.training_capture.snapshot_writer import SnapshotWriter
 from sglang.srt.training_capture.startup import (
     coordinate_capture_activation,
@@ -135,6 +140,12 @@ class CaptureCoordinator:
         def build_local():
             nonlocal config
             config = CaptureConfig.load(config_path)
+            codec = get_codec(config.contract_id)
+            if (
+                codec.teacher.kind == "final_hidden"
+                and model_config.dtype != torch.bfloat16
+            ):
+                raise ContractError("experimental final-hidden capture requires BF16")
             contract = bind_rank_target_contract(
                 model_id=config.model_id,
                 selected_layer_ids=config.selected_layer_ids,
@@ -151,11 +162,12 @@ class CaptureCoordinator:
                 pp_size=pp_size,
                 dp_rank=dp_rank,
             )
-            warmup_teacher_capture(
-                contract.teacher.vocab_size,
-                getattr(pool, "device", "cpu"),
-                topk_backend=config.teacher_topk_backend,
-            )
+            if codec.teacher.kind == "top128":
+                warmup_teacher_capture(
+                    contract.teacher.vocab_size,
+                    getattr(pool, "device", "cpu"),
+                    topk_backend=config.teacher_topk_backend,
+                )
             return contract
 
         topology = {"tp_size": tp_size, "pp_size": pp_size, "dp_rank": dp_rank}
@@ -214,7 +226,7 @@ class CaptureCoordinator:
                 "partition": layout.partition(OWNER),
                 "source_pool": pool,
             }
-            if config.teacher_capture_backend == "async_ring":
+            if config.teacher_capture_backend in ("async_ring", "final_hidden"):
                 resource_args["teacher"] = teacher
             if tree_cache is not None:
                 resource_args["tree_cache"] = tree_cache
@@ -286,6 +298,7 @@ class CaptureCoordinator:
         autostart=True,
     ):
         self.config, self.teacher, self.kv = config, teacher, kv
+        self.codec = get_codec(config.contract_id)
         self.config_sha256 = config.fingerprint
         self.layout = plan_capture_layout(
             kv, tp_size=1, pp_layer_ranges=[(0, max(kv.selected_layer_ids) + 1)]
@@ -316,7 +329,7 @@ class CaptureCoordinator:
         if self.writer_process is not None and capture_mode != "autoregressive":
             raise ContractError("process writer requires autoregressive serving")
         self.writer = self.writer_process or SnapshotWriter(
-            self.store, self.catalog, self.journal
+            self.store, self.catalog, self.journal, codec=self.codec
         )
         self.lock = threading.RLock()
         self.stop = threading.Event()
@@ -647,6 +660,7 @@ class CaptureCoordinator:
                 max_tokens=len(req.origin_input_ids) + requested,
                 vocab_size=self.teacher.vocab_size,
                 teacher_batcher=self.teacher_batcher,
+                codec=self.codec,
             )
             req.training_capture_context = record
             if self.config.kv_source == "hicache_l2":
@@ -790,8 +804,8 @@ class CaptureCoordinator:
         if teacher_indices:
             try:
                 if self.teacher_batcher is not None:
-                    self.teacher_batcher.enqueue(
-                        logits_output.next_token_logits,
+                    self.teacher_batcher.append(
+                        getattr(logits_output, self.codec.teacher.output_field, None),
                         teacher_indices,
                         [
                             (record.context, position)
@@ -1229,11 +1243,16 @@ class CaptureCoordinator:
         }
         if self.writer_process is not None:
             self._check_publication(record)
-            self.writer_process.build_and_write(
-                record.slot,
-                SnapshotMetadata(sequence=record.context.sequence, **metadata),
-                record.context.kv_end,
-                record.lease,
+            self.writer_process.publish(
+                HostReadyCapture(
+                    slot_id=self.writer_process.indices[id(record.slot)],
+                    slot_epoch=record.slot.epoch,
+                    metadata=SnapshotMetadata(
+                        sequence=record.context.sealed.sequence, **metadata
+                    ),
+                    valid_kv_tokens=record.context.sealed.valid_kv_tokens,
+                    lease=record.lease,
+                ),
                 **callbacks,
             )
             self._count("snapshot_built")

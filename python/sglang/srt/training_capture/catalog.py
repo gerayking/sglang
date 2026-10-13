@@ -213,13 +213,16 @@ class HTTPCaptureCatalog:
     def check_compatibility(
         self, *, contract_id: str, kv_codec: str, store_protocol: str
     ) -> CatalogCapabilities:
+        from sglang.srt.training_capture.codec import get_codec
+
+        codec = get_codec(contract_id)
         capabilities = self.capabilities()
         if capabilities.protocol_version != 1:
             raise CatalogConflict("unsupported Catalog producer protocol")
         if not any(
             contract.contract_id == contract_id
             and contract.schema_version == 1
-            and contract.payload_format == "maas_target_kv_v1"
+            and contract.payload_format == codec.payload_format
             and kv_codec in contract.kv_codecs
             for contract in capabilities.contracts
         ):
